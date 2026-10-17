@@ -12,6 +12,7 @@ import {
   BurnRunDetailViewSchema,
   BurnRunSummaryViewSchema,
   FreeModelViewSchema,
+  UnattendedPreflightViewSchema,
   UpstreamIssueViewSchema,
 } from "./view.ts";
 
@@ -135,6 +136,24 @@ export const burnSupervisorOpen = defineRpc({
       projectRoot: z.string(),
       slug: z.string(),
       supervisorLane: z.string(),
+    }),
+    Failure,
+  ]),
+});
+
+export const burnPreflight = defineRpc({
+  name: "burn.preflight",
+  input: z.object({
+    mode: z.enum(["warmup", "open-settings"]).optional(),
+    projectSlug: z.string().optional(),
+    projectRoot: z.string().optional(),
+  }),
+  output: z.union([
+    z.object({
+      ok: z.literal(true),
+      mode: z.enum(["warmup", "open-settings"]),
+      preflight: UnattendedPreflightViewSchema,
+      opened: z.array(z.string()).optional(),
     }),
     Failure,
   ]),

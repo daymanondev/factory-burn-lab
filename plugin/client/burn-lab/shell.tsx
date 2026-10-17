@@ -16,6 +16,7 @@ import { useState } from "react";
 import { Pressable, Text, View } from "react-native";
 import {
   burnDetail,
+  burnPreflight,
   burnProjectAdd,
   burnScout,
   burnSnapshot,
@@ -221,6 +222,7 @@ export function BurnLabShell({
 }) {
   const toast = useToast();
   const snapshotCall = useRpc(burnSnapshot);
+  const preflightCall = useRpc(burnPreflight);
   const scoutCall = useRpc(burnScout);
   const startCall = useRpc(burnStart);
   const detailCall = useRpc(burnDetail);
@@ -427,6 +429,40 @@ export function BurnLabShell({
     });
   };
 
+  const handleWarmupPermissions = () => {
+    setStatusNote("Running Unattended Preflight warm-up (folders, network, OpenCode --auto)…");
+    void runAction("Warm Up Permissions", async () => {
+      const res = await preflightCall({
+        mode: "warmup",
+        projectSlug: activeProject?.slug,
+        projectRoot: activeProject?.root,
+      });
+      if (res.ok) {
+        const msg = res.preflight.ready
+          ? `Unattended preflight ready (${res.preflight.responsibleBundle})`
+          : `Preflight completed with ${res.preflight.issues.length} warning(s)`;
+        setStatusNote(msg);
+      }
+      return res;
+    });
+  };
+
+  const handleOpenSecuritySettings = () => {
+    void runAction("Open OS Security Settings", async () => {
+      const res = await preflightCall({
+        mode: "open-settings",
+        projectSlug: activeProject?.slug,
+        projectRoot: activeProject?.root,
+      });
+      if (res.ok) {
+        setStatusNote(
+          `Opened OS security settings (${(res.opened ?? []).join(", ") || res.preflight.platform})`,
+        );
+      }
+      return res;
+    });
+  };
+
   const handleFileUpstreamIssue = () => {
     const title = issueDraft.title.trim();
     const problem = issueDraft.problem.trim();
@@ -579,6 +615,144 @@ export function BurnLabShell({
             icon="GitPullRequest"
           />
         </View>
+
+        {/* Unattended Preflight & Permission Readiness Strip */}
+        {view.preflight ? (
+          <Card theme={theme} gap={SPACING[2]}>
+            <View
+              style={{
+                flexDirection: "row",
+                alignItems: "center",
+                flexWrap: "wrap",
+                gap: SPACING[1.5],
+              }}
+            >
+              <View
+                style={{
+                  flexDirection: "row",
+                  alignItems: "center",
+                  gap: SPACING[1],
+                  paddingRight: SPACING[1],
+                }}
+              >
+                <Icon
+                  name={view.preflight.ready ? "ShieldCheck" : "AlertTriangle"}
+                  size={13}
+                  color={
+                    view.preflight.ready
+                      ? theme.colors.statusSuccess
+                      : theme.colors.statusWarning
+                  }
+                />
+                <Text style={text(theme, "badge")}>UNATTENDED PREFLIGHT</Text>
+              </View>
+
+              <Pill
+                theme={theme}
+                label={`Host: ${view.preflight.responsibleBundle}`}
+                tone={view.preflight.shipItStaleBinary ? "statusDanger" : "accent"}
+                lit
+                mono
+              />
+
+              {view.preflight.fullDiskAccessGranted !== null ? (
+                <Pill
+                  theme={theme}
+                  label={
+                    view.preflight.platform === "darwin"
+                      ? view.preflight.fullDiskAccessGranted
+                        ? "Full Disk Access: Granted"
+                        : "Full Disk Access: Off"
+                      : view.preflight.fullDiskAccessGranted
+                        ? "Folder Protection: Clear"
+                        : "Protected Folder"
+                  }
+                  tone={
+                    view.preflight.fullDiskAccessGranted
+                      ? "statusSuccess"
+                      : "statusWarning"
+                  }
+                  lit
+                />
+              ) : null}
+
+              <Pill
+                theme={theme}
+                label={
+                  view.preflight.openCodeAutoReady
+                    ? "OpenCode --auto: Ready"
+                    : "OpenCode --auto: Missing"
+                }
+                tone={view.preflight.openCodeAutoReady ? "statusSuccess" : "statusWarning"}
+                lit
+              />
+
+              <Pill
+                theme={theme}
+                label={
+                  view.preflight.sleepAssertionActive
+                    ? "Sleep Assertion: Active"
+                    : "Sleep Assertion: On-Run"
+                }
+                tone={view.preflight.sleepAssertionActive ? "statusSuccess" : "foregroundMuted"}
+                lit={view.preflight.sleepAssertionActive}
+              />
+
+              <View
+                style={{
+                  marginLeft: "auto",
+                  flexDirection: "row",
+                  alignItems: "center",
+                  gap: SPACING[1.5],
+                  flexWrap: "wrap",
+                }}
+              >
+                <Btn
+                  theme={theme}
+                  small
+                  icon="Zap"
+                  label="Warm Up Permissions"
+                  tone="accent"
+                  disabled={busy}
+                  onPress={handleWarmupPermissions}
+                />
+                {view.preflight.platform === "darwin" ||
+                view.preflight.platform === "win32" ? (
+                  <Btn
+                    theme={theme}
+                    small
+                    icon="Settings"
+                    label={
+                      view.preflight.platform === "darwin"
+                        ? "Grant Full Disk Access"
+                        : "Open Windows Security"
+                    }
+                    tone="foregroundMuted"
+                    disabled={busy}
+                    onPress={handleOpenSecuritySettings}
+                  />
+                ) : null}
+              </View>
+            </View>
+
+            {view.preflight.issues.length > 0 ? (
+              <View style={{ gap: SPACING[1] }}>
+                {view.preflight.issues.map((issue, idx) => (
+                  <Text
+                    key={`preflight-issue-${idx}`}
+                    style={text(
+                      theme,
+                      "meta",
+                      view.preflight?.shipItStaleBinary ? "statusDanger" : "statusWarning",
+                    )}
+                  >
+                    • {issue}
+                  </Text>
+                ))}
+              </View>
+            ) : null}
+          </Card>
+        ) : null}
 
         {/* Project Selector + 1-Click Open Supervisor Bridge */}
         <Card theme={theme} gap={SPACING[2.5]}>

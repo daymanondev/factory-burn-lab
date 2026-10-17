@@ -79,3 +79,18 @@ _Avoid_: cron job, background grinder
 **Self-evolve**:
 The `Burn playbook` that targets `factory-burn-lab` itself as the active `Project`, using the `Free pool` under `paseo-factory`'s `Gate` (`npm test && npm run check:bundle`) to build new `Burn lab` features and filing an `Upstream issue` whenever a core `paseo-factory` change is required.
 _Avoid_: self-modifying code, auto-update
+
+### Unattended execution
+
+**Unattended preflight**:
+The upfront readiness check and eager permission probe executed before or at the start of a `Burn run` to ensure neither the operating system nor the agent harness will pause mid-run for interactive approval.
+_Avoid_: warm-up script, permission check, health check
+
+**Responsible bundle**:
+The host application bundle or executable to which the operating system attributes file, folder, and network access performed by `Burn lab` and its spawned child processes.
+_Avoid_: parent process, wrapper app, daemon binary
+
+**Sleep assertion**:
+The run-scoped power lock held while at least one `Burn run` is active so the host machine does not idle-sleep mid-run and automatically resumes normal sleep policy once all runs finish.
+_Avoid_: wake lock, keep-alive, anti-sleep
+

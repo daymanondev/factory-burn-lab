@@ -132,8 +132,54 @@ export function saveFreePool(paseoHome: string, state: FreePoolState): void {
   writeFileSync(path, `${JSON.stringify(state, null, 2)}\n`, "utf8");
 }
 
-export function candidateBinDirs(home: string = homedir()): string[] {
+export const UNATTENDED_OPENCODE_CONFIG = JSON.stringify({
+  permission: {
+    "*": "allow",
+    external_directory: "allow",
+    doom_loop: "allow",
+    question: "deny",
+    read: {
+      "*": "allow",
+      "*.env": "allow",
+      "*.env.*": "allow",
+      "*.env.example": "allow",
+    },
+  },
+});
+
+export function candidateBinDirs(
+  home: string = homedir(),
+  platform: string = process.platform,
+  env: NodeJS.ProcessEnv = process.env,
+): string[] {
   const dirs: string[] = [];
+
+  if (platform === "win32") {
+    const appData = env.APPDATA ?? join(home, "AppData", "Roaming");
+    const localAppData = env.LOCALAPPDATA ?? join(home, "AppData", "Local");
+    const nvmHome = env.NVM_HOME ?? join(localAppData, "nvm");
+    const nvmSymlink = env.NVM_SYMLINK ?? "C:\\Program Files\\nodejs";
+
+    if (existsSync(nvmHome)) {
+      try {
+        for (const ver of readdirSync(nvmHome).sort().reverse()) {
+          dirs.push(join(nvmHome, ver));
+        }
+      } catch {
+        // ignore
+      }
+    }
+    dirs.push(
+      join(appData, "npm"),
+      join(home, ".bun", "bin"),
+      join(home, ".local", "bin"),
+      join(home, "scoop", "shims"),
+      join(localAppData, "Microsoft", "WinGet", "Links"),
+      nvmSymlink,
+    );
+    return dirs;
+  }
+
   const nvmDir = join(home, ".nvm", "versions", "node");
   if (existsSync(nvmDir)) {
     try {
@@ -144,25 +190,57 @@ export function candidateBinDirs(home: string = homedir()): string[] {
       // ignore
     }
   }
-  dirs.push(join(home, ".local", "bin"), "/opt/homebrew/bin", "/usr/local/bin");
+  dirs.push(
+    join(home, ".bun", "bin"),
+    join(home, ".local", "bin"),
+    "/opt/homebrew/bin",
+    "/usr/local/bin",
+  );
   return dirs;
 }
 
-export function resolveOpenCodeBinary(): string {
-  for (const dir of candidateBinDirs()) {
-    const candidate = join(dir, "opencode");
-    if (existsSync(candidate)) {
-      return candidate;
+export function resolveOpenCodeBinary(
+  platform: string = process.platform,
+  home: string = homedir(),
+  env: NodeJS.ProcessEnv = process.env,
+): string {
+  const binNames =
+    platform === "win32"
+      ? ["opencode.exe", "opencode.cmd", "opencode"]
+      : ["opencode"];
+
+  for (const dir of candidateBinDirs(home, platform, env)) {
+    for (const name of binNames) {
+      const candidate = join(dir, name);
+      if (existsSync(candidate)) {
+        return candidate;
+      }
     }
   }
-  return "opencode";
+  return platform === "win32" ? "opencode.cmd" : "opencode";
 }
 
-export function buildExtendedPathEnv(): NodeJS.ProcessEnv {
-  const currentPath = process.env.PATH ?? "";
+export function buildExtendedPathEnv(
+  baseEnv: NodeJS.ProcessEnv = process.env,
+  platform: string = process.platform,
+  home: string = homedir(),
+): NodeJS.ProcessEnv {
+  const sep = platform === "win32" ? ";" : ":";
+  const currentPath = baseEnv.PATH ?? baseEnv.Path ?? "";
+  const joinedPath = [...candidateBinDirs(home, platform, baseEnv), currentPath]
+    .filter(Boolean)
+    .join(sep);
+
   return {
-    ...process.env,
-    PATH: [...candidateBinDirs(), currentPath].filter(Boolean).join(":"),
+    ...baseEnv,
+    PATH: joinedPath,
+    ...(platform === "win32" ? { Path: joinedPath } : {}),
+    CI: baseEnv.CI ?? "1",
+    GIT_TERMINAL_PROMPT: baseEnv.GIT_TERMINAL_PROMPT ?? "0",
+    GCM_INTERACTIVE: baseEnv.GCM_INTERACTIVE ?? "never",
+    HOST: baseEnv.HOST ?? "127.0.0.1",
+    OPENCODE_CONFIG_CONTENT:
+      baseEnv.OPENCODE_CONFIG_CONTENT ?? UNATTENDED_OPENCODE_CONFIG,
   };
 }
 
@@ -242,11 +320,20 @@ export function discoverFreePool(options?: {
     } else {
       try {
         const bin = resolveOpenCodeBinary();
-        rawList = execFileSync(bin, ["models"], {
-          env: buildExtendedPathEnv(),
-          encoding: "utf8",
-          timeout: 15_000,
-        });
+        const isWinCmd = process.platform === "win32" && /\.(cmd|bat)$/i.test(bin);
+        rawList = isWinCmd
+          ? execFileSync(process.env.ComSpec || "cmd.exe", ["/d", "/s", "/c", `"${bin}" models`], {
+              env: buildExtendedPathEnv(),
+              encoding: "utf8",
+              timeout: 15_000,
+              windowsHide: true,
+            })
+          : execFileSync(bin, ["models"], {
+              env: buildExtendedPathEnv(),
+              encoding: "utf8",
+              timeout: 15_000,
+              windowsHide: true,
+            });
       } catch {
         rawList = "";
       }
@@ -310,12 +397,15 @@ function defaultOpenCodeRunner(input: {
 }): Promise<OpenCodeRunResult> {
   const startedAt = Date.now();
   const bin = resolveOpenCodeBinary();
+  const isWinCmd = process.platform === "win32" && /\.(cmd|bat)$/i.test(bin);
 
   return new Promise((resolvePromise) => {
-    const child = spawn(bin, ["run", "--standalone", "-m", input.model, input.prompt], {
+    const child = spawn(bin, ["run", "--standalone", "--auto", "-m", input.model, input.prompt], {
       cwd: input.cwd,
       env: { ...buildExtendedPathEnv(), PWD: input.cwd },
       stdio: ["ignore", "pipe", "pipe"],
+      windowsHide: true,
+      ...(isWinCmd ? { shell: true } : {}),
     });
 
     let stdout = "";
