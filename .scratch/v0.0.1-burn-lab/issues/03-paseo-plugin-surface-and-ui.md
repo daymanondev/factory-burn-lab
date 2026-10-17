@@ -1,6 +1,6 @@
 # 03 — Paseo plugin server RPCs and 100% UI-driven `Burn Lab` surface
 
-Status: ready-for-agent
+Status: done
 Blocked by: 02
 
 ## Scope
@@ -18,3 +18,7 @@ Blocked by: 02
    - Playbook launcher card (`OSS Lab`, `Proto Arena`, `Night Shift`, `Self-Evolve`, `Scout Pool`) with `Start Burn Run` button.
    - Live `Burn Runs & Deliverables` list + Detail modal + `Factory Upstream Issues` drawer.
 3. Verify `npm test` and `npm run check:bundle`.
+
+## Comments
+
+- Resolved on `feat/v0.0.1-burn-lab` (`130383f` + `c39ee3d`): implemented `plugin/shared/view.ts`, `plugin/shared/rpc.ts`, `plugin/server/surface-rpc.ts`, `plugin/client/burn-lab/shell.tsx`, `plugin/client/burn-lab/entries.tsx`, `plugin/index.client.tsx`, `plugin/index.server.ts`, and `test/surface-rpc.test.ts`.
