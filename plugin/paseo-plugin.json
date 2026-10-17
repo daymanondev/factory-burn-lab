@@ -1,0 +1,7 @@
+{
+  "id": "factory-burn-lab",
+  "description": "Companion Paseo plugin for paseo-factory: autonomous OpenCode free-model burner (Scout Pool, OSS Lab, Proto Arena, Night Shift, Self-Evolve) supervised by each Project's strong Supervisor seat.",
+  "requirements": {
+    "paseo": ">=0.11.0 <0.12.0"
+  }
+}

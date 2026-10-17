@@ -1,0 +1,5 @@
+.DS_Store
+.zcode/
+node_modules
+.env
+.env.*
