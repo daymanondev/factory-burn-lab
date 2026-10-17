@@ -15,16 +15,30 @@ import {
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { type CitationGateResult, verifyCitations } from "./citation-gate.ts";
 import {
+  changedFiles,
+  type ClaimOutcome,
+  createFactory,
+  diffBetween,
   discoverProjects,
+  type Factory,
+  headCommitSync,
   type LaneCliRunner,
   lanesPath,
   listProjectRegistrations,
   loadLanes,
+  MAX_ATTEMPTS,
+  parseEyeAnswer,
   parseLane,
+  prepareTaskWorktree,
   projectLanesPath,
+  projectStateDir,
   readProjectRegistration,
   resolveProject,
   runLaneCli,
+  tailWithMarker,
+  WATCH_DIFF_MAX_CHARS,
+  WATCH_GATE_OUTPUT_MAX_CHARS,
+  WATCH_QUESTIONS,
   writeProjectRegistration,
 } from "./factory-core/index.ts";
 import {
@@ -91,6 +105,8 @@ export interface BurnFramingPlan {
   goal: string;
   subtasks: string[];
   gateCommand: string;
+  artifact: string;
+  scope?: string[];
   citationRequired: boolean;
   rawSupervisorOutput: string;
 }
@@ -110,10 +126,17 @@ export interface BurnAttemptRecord {
   role: SwarmRole;
   subtask: string;
   ok: boolean;
+  attemptCount: number;
   latencyMs: number;
   output: string;
   worktreeDir?: string;
   branchName?: string;
+  baseCommit?: string;
+  claimedCommit?: string;
+  diffPatch?: string;
+  changedFiles?: string[];
+  factoryVerdict?: "green" | "red";
+  factoryReportPath?: string;
   gateResult?: GateRunResult;
   citationResult?: CitationGateResult;
   accepted: boolean;
@@ -150,6 +173,9 @@ export interface BurnRunRecord {
   winningAttemptId?: string;
   winningModel?: string;
   winningBranch?: string;
+  winningCommit?: string;
+  landingStatus?: "not_landed" | "landed" | "pending-conflict";
+  landingNote?: string;
   reportPath?: string;
   reportMarkdown?: string;
   upstreamIssue?: UpstreamIssue;
@@ -773,24 +799,64 @@ export async function defaultSupervisorRunner(input: {
   };
 }
 
+export function inferDefaultGate(projectRoot: string, playbook: BurnPlaybook): string {
+  if (playbook === "self-evolve") {
+    return "npm test && npm run check:bundle";
+  }
+  const pkgPath = join(projectRoot, "package.json");
+  if (existsSync(pkgPath)) {
+    try {
+      const pkg = JSON.parse(readFileSync(pkgPath, "utf8")) as {
+        scripts?: Record<string, unknown>;
+      };
+      const testScript = pkg?.scripts?.test;
+      if (
+        typeof testScript === "string" &&
+        testScript.trim() !== "" &&
+        !testScript.includes("no test specified")
+      ) {
+        return "npm test";
+      }
+    } catch {
+      // ignore malformed package.json
+    }
+  }
+  return 'node -e "process.exit(0)"';
+}
+
+export function inferDefaultArtifact(projectRoot: string): string {
+  if (existsSync(join(projectRoot, "package.json"))) {
+    return "package.json";
+  }
+  if (existsSync(join(projectRoot, "README.md"))) {
+    return "README.md";
+  }
+  return ".";
+}
+
 function parseFramingOutput(
   rawOutput: string,
   playbook: BurnPlaybook,
   userPrompt: string,
+  projectRoot: string,
   overrideGate?: string,
 ): BurnFramingPlan {
-  const defaultGate =
-    overrideGate ??
-    (playbook === "self-evolve"
-      ? "npm test && npm run check:bundle"
-      : "node -e \"process.exit(0)\"");
+  const defaultGate = overrideGate ?? inferDefaultGate(projectRoot, playbook);
+  const defaultArtifact = inferDefaultArtifact(projectRoot);
 
   try {
     const jsonMatch = rawOutput.match(/\{[\s\S]*\}/);
     if (jsonMatch) {
       const parsed = JSON.parse(jsonMatch[0]) as Partial<BurnFramingPlan>;
+      const parsedScope =
+        Array.isArray(parsed.scope) && parsed.scope.length > 0
+          ? parsed.scope.map((s) => String(s).trim()).filter(Boolean)
+          : undefined;
       return {
-        goal: typeof parsed.goal === "string" && parsed.goal.trim() ? parsed.goal.trim() : userPrompt,
+        goal:
+          typeof parsed.goal === "string" && parsed.goal.trim()
+            ? parsed.goal.trim()
+            : userPrompt,
         subtasks:
           Array.isArray(parsed.subtasks) && parsed.subtasks.length > 0
             ? parsed.subtasks.map(String)
@@ -800,6 +866,11 @@ function parseFramingOutput(
           (typeof parsed.gateCommand === "string" && parsed.gateCommand.trim()
             ? parsed.gateCommand.trim()
             : defaultGate),
+        artifact:
+          typeof parsed.artifact === "string" && parsed.artifact.trim()
+            ? parsed.artifact.trim()
+            : defaultArtifact,
+        ...(parsedScope && parsedScope.length > 0 ? { scope: parsedScope } : {}),
         citationRequired:
           typeof parsed.citationRequired === "boolean"
             ? parsed.citationRequired
@@ -815,9 +886,178 @@ function parseFramingOutput(
     goal: userPrompt,
     subtasks: [userPrompt],
     gateCommand: defaultGate,
+    artifact: defaultArtifact,
     citationRequired: playbook === "oss-lab",
     rawSupervisorOutput: rawOutput,
   };
+}
+
+const SKIP_DIRS = new Set([
+  ".git",
+  "node_modules",
+  "dist",
+  "build",
+  ".next",
+  "coverage",
+  "vendor",
+]);
+
+const SKIP_LOCKFILES = new Set([
+  "package-lock.json",
+  "pnpm-lock.yaml",
+  "yarn.lock",
+  "bun.lockb",
+  "cargo.lock",
+  "poetry.lock",
+]);
+
+const BINARY_EXT_PATTERN =
+  /\.(?:png|jpe?g|gif|webp|ico|svg|woff2?|ttf|eot|pdf|zip|tar|gz|exe|dll|so|dylib|wasm|mp4|mp3|mov|avi|lock)$/i;
+
+function walkTrackedOrLocalFiles(repoRoot: string): string[] {
+  try {
+    const out = execFileSync("git", ["ls-files"], {
+      cwd: repoRoot,
+      encoding: "utf8",
+      env: buildExtendedPathEnv(),
+      stdio: ["ignore", "pipe", "ignore"],
+      timeout: 10_000,
+    });
+    const tracked = out
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter(Boolean);
+    if (tracked.length > 0) {
+      return tracked;
+    }
+  } catch {
+    // fall back to directory walk below
+  }
+
+  const collected: string[] = [];
+  const walk = (relDir: string, depth: number) => {
+    if (depth > 5 || collected.length >= 250) return;
+    const absDir = relDir ? join(repoRoot, relDir) : repoRoot;
+    let entries: string[] = [];
+    try {
+      entries = readdirSync(absDir).sort();
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      if (SKIP_DIRS.has(entry)) continue;
+      const relPath = relDir ? `${relDir}/${entry}` : entry;
+      const absPath = join(repoRoot, relPath);
+      try {
+        const st = statSync(absPath);
+        if (st.isDirectory()) {
+          walk(relPath, depth + 1);
+        } else if (st.isFile()) {
+          collected.push(relPath);
+        }
+      } catch {
+        // ignore unreadable entries
+      }
+    }
+  };
+  walk("", 0);
+  return collected;
+}
+
+export function buildSmartRepoExcerpts(
+  inspectRepoRoot: string,
+  prompt: string,
+  subtasks: string[] = [],
+  options?: { maxFiles?: number; maxLinesPerFile?: number },
+): string[] {
+  const maxFiles = options?.maxFiles ?? 10;
+  const maxLinesPerFile = options?.maxLinesPerFile ?? 250;
+  const queryText = [prompt, ...subtasks].join(" ");
+  const queryLower = queryText.toLowerCase();
+  const keywords = [
+    ...new Set(
+      (queryText.match(/[A-Za-z0-9_.-]{2,}/g) ?? []).map((tok) => tok.toLowerCase()),
+    ),
+  ];
+
+  const allFiles = walkTrackedOrLocalFiles(inspectRepoRoot);
+  const candidates: Array<{ rel: string; score: number; lines: string[] }> = [];
+
+  for (const rel of allFiles) {
+    const normalizedRel = rel.replace(/\\/g, "/");
+    const segments = normalizedRel.split("/");
+    if (segments.some((seg) => SKIP_DIRS.has(seg))) continue;
+    const baseLower = basename(normalizedRel).toLowerCase();
+    if (SKIP_LOCKFILES.has(baseLower)) continue;
+    if (BINARY_EXT_PATTERN.test(baseLower)) continue;
+
+    const abs = join(inspectRepoRoot, normalizedRel);
+    if (!existsSync(abs)) continue;
+    let rawContent = "";
+    try {
+      const st = statSync(abs);
+      if (!st.isFile() || st.size === 0 || st.size > 512_000) continue;
+      rawContent = readFileSync(abs, "utf8");
+    } catch {
+      continue;
+    }
+    if (rawContent.includes("\0")) continue;
+
+    const trimmedContent = rawContent.replace(/\r?\n$/, "");
+    const lines = trimmedContent.length === 0 ? [] : trimmedContent.split(/\r?\n/);
+    if (lines.length === 0) continue;
+
+    let score = 0;
+    const relLower = normalizedRel.toLowerCase();
+
+    // Architectural priority
+    if (relLower === "readme.md") score += 45;
+    else if (relLower === "package.json") score += 40;
+    else if (relLower === "context.md" || relLower === "glossary.md") score += 35;
+    else if (/^src\/(index|main|app)\.[a-z]+$/i.test(normalizedRel)) score += 32;
+    else if (relLower.startsWith("src/")) score += 20;
+
+    if (/\.(ts|tsx|js|mjs|py|rs|go|md|json)$/i.test(normalizedRel)) {
+      score += 10;
+    }
+
+    // Direct path or filename mention in prompt/subtasks
+    if (queryLower.includes(relLower)) {
+      score += 120;
+    } else if (baseLower.length >= 4 && queryLower.includes(baseLower)) {
+      score += 60;
+    }
+
+    const contentLower = trimmedContent.toLowerCase();
+    for (const kw of keywords) {
+      if (kw.length < 3) continue;
+      if (relLower.includes(kw)) {
+        score += 18;
+      }
+      if (contentLower.includes(kw)) {
+        score += 4;
+      }
+    }
+
+    candidates.push({ rel: normalizedRel, score, lines });
+  }
+
+  candidates.sort((a, b) => {
+    if (b.score !== a.score) return b.score - a.score;
+    if (a.rel.length !== b.rel.length) return a.rel.length - b.rel.length;
+    return a.rel.localeCompare(b.rel);
+  });
+
+  const selected = candidates.slice(0, maxFiles);
+  return selected.map(({ rel, lines }) => {
+    const excerptCount = Math.min(lines.length, maxLinesPerFile);
+    const numbered = lines
+      .slice(0, excerptCount)
+      .map((line, i) => `${i + 1}: ${line}`)
+      .join("\n");
+    const exampleEnd = Math.min(lines.length, 5);
+    return `File ${rel} (total lines: 1-${lines.length}; valid citation example: [${rel}:1-${exampleEnd}]):\n${numbered}`;
+  });
 }
 
 const DEFAULT_FALLBACK_FREE_MODELS: FreeModelRecord[] = [
@@ -957,6 +1197,11 @@ async function runCouncilCrossCheck(input: {
   attempts: BurnAttemptRecord[];
   councilNotes: BurnCouncilNote[];
 }): Promise<void> {
+  const watchChecklist = WATCH_QUESTIONS.map(
+    (q, idx) =>
+      `${idx + 1}. ${q.name} — ${q.instructions}\n   - CHALLENGE if: ${q.criteria.true}\n   - CLEAR if: ${q.criteria.false}`,
+  ).join("\n");
+
   for (const attempt of input.attempts.filter((a) => a.accepted)) {
     const reviewers = pickCrossFamilyReviewers(
       input.paseoHome,
@@ -964,6 +1209,27 @@ async function runCouncilCrossCheck(input: {
       attempt.model,
       2,
     );
+    const diffSection =
+      attempt.diffPatch !== undefined || attempt.role === "coder"
+        ? [
+            "",
+            "GIT_DIFF (base..claimed):",
+            tailWithMarker(attempt.diffPatch || "(no files changed in git diff)", WATCH_DIFF_MAX_CHARS),
+          ]
+        : [];
+    const gateSection =
+      attempt.gateResult !== undefined
+        ? [
+            "",
+            `GATE_OUTPUT (command="${attempt.gateResult.command}", exit=${attempt.gateResult.exitCode}):`,
+            tailWithMarker(
+              [attempt.gateResult.stdout, attempt.gateResult.stderr].filter(Boolean).join("\n") ||
+                "(empty gate output)",
+              WATCH_GATE_OUTPUT_MAX_CHARS,
+            ),
+          ]
+        : [];
+
     const notesForAttempt = await Promise.all(
       reviewers.map(async (reviewer) => {
         const councilRes = await runOpenCodeFreeModel({
@@ -972,14 +1238,25 @@ async function runCouncilCrossCheck(input: {
             "COUNCIL_REVIEW",
             "Do not call any tools (do not call read, glob, grep, or bash).",
             `Cross-examine the following ${input.playbook} attempt (${attempt.id}) from ${attempt.model} (family=${attempt.family}):`,
+            `Subtask: ${attempt.subtask}`,
+            "",
+            "WORKER_OUTPUT:",
             attempt.output,
-            "If the output is coherent and satisfies the subtask, reply immediately on a single line with: VERDICT: APPROVE — <1 sentence summary>. Only reply VERDICT: CHALLENGE if the output is empty, contradictory, or fabricates broken claims.",
+            ...diffSection,
+            ...gateSection,
+            "",
+            "WATCH_QUESTIONS (Fresh-Eyes & Watch Checklist):",
+            watchChecklist,
+            "",
+            "If the attempt satisfies the subtask and is CLEAR on all 5 WATCH_QUESTIONS, reply immediately on a single line with: VERDICT: APPROVE — <1 sentence summary>. Reply VERDICT: CHALLENGE — <reason> if the output is empty, contradictory, fabricates claims, or triggers any WATCH_QUESTIONS concern (such as test-weakened, destructive-writes, stuck-loop, scope-creep, or secret-leak).",
           ].join("\n"),
           cwd: attempt.worktreeDir ?? input.cwd,
           timeoutMs: input.timeoutMs,
           runner: input.openCodeRunner,
         });
-        const isChallenge = /VERDICT:\s*CHALLENGE/i.test(councilRes.stdout);
+        const eyeParsed = parseEyeAnswer(councilRes.stdout);
+        const isChallenge =
+          /VERDICT:\s*CHALLENGE/i.test(councilRes.stdout) || eyeParsed.outcome === "concern";
         const note: BurnCouncilNote = {
           reviewerModel: reviewer.id,
           reviewerFamily: reviewer.family,
@@ -1056,6 +1333,302 @@ function prepareIsolatedWorktree(
     }
   }
   return { worktreeDir: destDir, branchName: createdBranch };
+}
+
+function commitWorktreeChanges(
+  worktreeDir: string,
+  playbook: BurnPlaybook,
+  attemptId: string,
+  tryNum: number,
+): string | undefined {
+  const initialHead = headCommitSync(worktreeDir);
+  if (!initialHead) return undefined;
+  try {
+    execFileSync("git", ["add", "-A"], {
+      cwd: worktreeDir,
+      env: buildExtendedPathEnv(),
+      stdio: "ignore",
+      timeout: 10_000,
+    });
+    const statusOut = execFileSync("git", ["status", "--porcelain"], {
+      cwd: worktreeDir,
+      encoding: "utf8",
+      env: buildExtendedPathEnv(),
+      stdio: ["ignore", "pipe", "ignore"],
+      timeout: 10_000,
+    }).trim();
+    if (statusOut.length > 0) {
+      execFileSync(
+        "git",
+        [
+          "-c",
+          "user.email=burn-lab@local",
+          "-c",
+          "user.name=Factory Burn Lab",
+          "commit",
+          "-m",
+          `burn(${playbook}): ${attemptId} try ${tryNum}`,
+        ],
+        {
+          cwd: worktreeDir,
+          env: buildExtendedPathEnv(),
+          stdio: "ignore",
+          timeout: 10_000,
+        },
+      );
+    }
+  } catch {
+    // ignore commit failure
+  }
+  return headCommitSync(worktreeDir) ?? initialHead;
+}
+
+function mirrorRunScopedLedger(factoryStateDir: string, projectSlug: string): void {
+  try {
+    const scopedLedger = join(projectStateDir(factoryStateDir, projectSlug), "ledger.jsonl");
+    if (existsSync(scopedLedger)) {
+      cpSync(scopedLedger, join(factoryStateDir, "ledger.jsonl"));
+    }
+  } catch {
+    // best-effort mirror
+  }
+}
+
+async function executeCoderAttemptWithFactory(input: {
+  runFactory: Factory;
+  factoryStateDir: string;
+  projectSlug: string;
+  runId: string;
+  playbook: BurnPlaybook;
+  hostRoot: string;
+  artifactDir: string;
+  attemptId: string;
+  model: FreeModelRecord;
+  subtask: string;
+  basePromptLines: string[];
+  effectiveGateCommand: string;
+  artifact: string;
+  scope?: string[];
+  citationRequired: boolean;
+  maxAttempts: number;
+  timeoutMs: number;
+  openCodeRunner?: OpenCodeRunner;
+  customGateRunner?: GateRunner;
+}): Promise<BurnAttemptRecord> {
+  const baseCommit = headCommitSync(input.hostRoot);
+  const desiredBranch = `burn/${input.runId}/${modelBranchSlug(input.model.id)}`;
+  const desiredWorktreeDir = join(input.artifactDir, "worktrees", input.attemptId);
+
+  const prepared = prepareTaskWorktree({
+    stateDir: input.factoryStateDir,
+    workspace: input.hostRoot,
+    task: input.attemptId,
+    base: baseCommit,
+    worktreePath: desiredWorktreeDir,
+    branchName: desiredBranch,
+    symlinkNodeModules: true,
+  });
+
+  let worktreeDir: string;
+  let branchName: string | undefined;
+  if (prepared.ok) {
+    worktreeDir = prepared.path;
+    branchName = prepared.branch;
+  } else {
+    const fallback = prepareIsolatedWorktree(input.hostRoot, desiredWorktreeDir, desiredBranch);
+    worktreeDir = fallback.worktreeDir;
+    branchName = fallback.branchName;
+  }
+
+  const wtHead = headCommitSync(worktreeDir);
+  const canUseFactory = Boolean(wtHead);
+  const contractGate = input.customGateRunner
+    ? 'node -e "process.exit(0)"'
+    : input.effectiveGateCommand;
+
+  if (canUseFactory) {
+    input.runFactory.setContract({
+      task: input.attemptId,
+      workspace: worktreeDir,
+      gate: contractGate,
+      artifact: input.artifact || ".",
+      ...(input.scope && input.scope.length > 0 ? { scope: input.scope } : {}),
+      description: input.subtask,
+      by: "supervisor",
+    });
+    input.runFactory.requestSpawn({
+      task: input.attemptId,
+      provider: input.model.id,
+      arity: 1,
+      worktree: worktreeDir,
+    });
+    mirrorRunScopedLedger(input.factoryStateDir, input.projectSlug);
+  }
+
+  let attemptCount = 0;
+  let totalLatencyMs = 0;
+  let lastOutput = "";
+  let lastOk = false;
+  let claimedCommit: string | undefined;
+  let diffPatch: string | undefined;
+  let changedFilesList: string[] | undefined;
+  let factoryVerdict: "green" | "red" | undefined;
+  let factoryReportPath: string | undefined;
+  let gateResult: GateRunResult | undefined;
+  let citationResult: CitationGateResult | undefined;
+  let accepted = false;
+  let rejectionReason: string | undefined;
+  let lastDiagnostic = "";
+
+  for (let tryNum = 1; tryNum <= input.maxAttempts; tryNum++) {
+    attemptCount = tryNum;
+    const promptLines = [...input.basePromptLines];
+    if (tryNum > 1 && lastDiagnostic) {
+      promptLines.push(
+        "",
+        `REWORK_ATTEMPT (${tryNum}/${input.maxAttempts}): Your previous attempt failed verification with the following diagnostics:`,
+        lastDiagnostic,
+        "Fix the issues above in the worktree so the Gate, scope/memory fence, and citations pass cleanly.",
+      );
+    }
+
+    const res = await runOpenCodeFreeModel({
+      model: input.model.id,
+      prompt: promptLines.join("\n"),
+      cwd: worktreeDir,
+      timeoutMs: input.timeoutMs,
+      runner: input.openCodeRunner,
+    });
+    totalLatencyMs += res.latencyMs;
+    lastOutput = res.stdout;
+    lastOk = res.ok;
+
+    claimedCommit = commitWorktreeChanges(worktreeDir, input.playbook, input.attemptId, tryNum);
+
+    let claimOutcome: ClaimOutcome | undefined;
+    if (canUseFactory && claimedCommit) {
+      claimOutcome = await input.runFactory.claim({
+        task: input.attemptId,
+        sha: claimedCommit,
+        agent: input.model.id,
+      });
+      factoryVerdict = claimOutcome.verdict;
+      factoryReportPath = claimOutcome.reportPath;
+      mirrorRunScopedLedger(input.factoryStateDir, input.projectSlug);
+    }
+
+    if (baseCommit && claimedCommit) {
+      const diffRes = await diffBetween(worktreeDir, baseCommit, claimedCommit);
+      if (diffRes.ok) {
+        diffPatch = diffRes.diff;
+      }
+      const filesRes = await changedFiles(worktreeDir, baseCommit, claimedCommit);
+      if (filesRes.ok) {
+        changedFilesList = filesRes.files;
+      }
+    }
+
+    const rawGateLog =
+      claimOutcome?.gate.outputPath && existsSync(claimOutcome.gate.outputPath)
+        ? readFileSync(claimOutcome.gate.outputPath, "utf8").trim()
+        : "";
+
+    if (input.customGateRunner) {
+      const customGate = await input.customGateRunner({
+        command: input.effectiveGateCommand,
+        cwd: worktreeDir,
+        timeoutMs: input.timeoutMs,
+      });
+      if (claimOutcome && claimOutcome.verdict === "red") {
+        factoryVerdict = "red";
+        gateResult = {
+          ok: false,
+          command: input.effectiveGateCommand,
+          exitCode: customGate.exitCode || 1,
+          stdout: customGate.stdout,
+          stderr: [claimOutcome.gate.note, customGate.stderr].filter(Boolean).join("\n"),
+        };
+      } else if (!customGate.ok) {
+        factoryVerdict = "red";
+        gateResult = customGate;
+      } else {
+        factoryVerdict = "green";
+        gateResult = customGate;
+      }
+    } else if (claimOutcome) {
+      const isGreen = claimOutcome.verdict === "green";
+      gateResult = {
+        ok: isGreen,
+        command: input.effectiveGateCommand,
+        exitCode: claimOutcome.gate.exit ?? (isGreen ? 0 : 1),
+        stdout: isGreen ? (rawGateLog || claimOutcome.gate.note) : rawGateLog,
+        stderr: isGreen ? "" : [claimOutcome.gate.note, rawGateLog].filter(Boolean).join("\n"),
+      };
+    } else {
+      gateResult = await defaultGateRunner({
+        command: input.effectiveGateCommand,
+        cwd: worktreeDir,
+        timeoutMs: input.timeoutMs,
+      });
+      factoryVerdict = gateResult.ok ? "green" : "red";
+    }
+
+    if (input.citationRequired) {
+      citationResult = verifyCitations(input.hostRoot, lastOutput);
+    }
+
+    const citationOk = citationResult ? citationResult.ok : true;
+    const gateAndFactoryOk = factoryVerdict === "green" && (gateResult ? gateResult.ok : true);
+    accepted = lastOk && gateAndFactoryOk && citationOk;
+    if (accepted) {
+      rejectionReason = undefined;
+      break;
+    }
+
+    if (!lastOk) {
+      rejectionReason = "Free model invocation failed";
+      lastDiagnostic = res.error ?? res.stderr ?? "Free model invocation failed";
+    } else if (citationResult && !citationResult.ok) {
+      const detail =
+        citationResult.totalCitations === 0
+          ? "0 citations found"
+          : citationResult.invalidCitations.map((c) => `${c.raw} (${c.reason})`).join("; ");
+      rejectionReason = `Citation gate failed: ${detail}`;
+      lastDiagnostic = rejectionReason;
+    } else {
+      const noteDetail =
+        claimOutcome?.verdict === "red"
+          ? [claimOutcome.gate.note, rawGateLog].filter(Boolean).join("\n")
+          : [gateResult?.stderr, gateResult?.stdout].filter(Boolean).join("\n");
+      const prefix = input.playbook === "oss-lab" ? "PoC Gate failed" : "Gate failed";
+      rejectionReason = `${prefix} (exit ${gateResult?.exitCode ?? 1})${noteDetail ? `: ${noteDetail}` : ""}`;
+      lastDiagnostic = rejectionReason;
+    }
+  }
+
+  return {
+    id: input.attemptId,
+    model: input.model.id,
+    family: input.model.family,
+    role: "coder",
+    subtask: input.subtask,
+    ok: lastOk,
+    attemptCount,
+    latencyMs: totalLatencyMs,
+    output: lastOutput,
+    worktreeDir,
+    branchName,
+    baseCommit,
+    claimedCommit,
+    diffPatch,
+    changedFiles: changedFilesList,
+    factoryVerdict,
+    factoryReportPath,
+    gateResult,
+    citationResult,
+    accepted,
+    rejectionReason,
+  };
 }
 
 function finalizeWorktreeBranches(
@@ -1139,6 +1712,7 @@ export async function runBurnPlaybook(input: {
   projectSlug?: string;
   targetRepo?: string;
   gateCommand?: string;
+  maxAttempts?: number;
   upstreamIssuesDir?: string;
   upstreamGap?: {
     slug: string;
@@ -1157,6 +1731,7 @@ export async function runBurnPlaybook(input: {
   timeoutMs?: number;
 }): Promise<BurnRunRecord> {
   const timeoutMs = input.timeoutMs ?? 45_000;
+  const effectiveMaxAttempts = Math.max(1, Math.min(MAX_ATTEMPTS, input.maxAttempts ?? 2));
   const projects = resolveBurnProjects(input.paseoHome);
   const project: BurnProject =
     (input.projectSlug ? projects.find((p) => p.slug === input.projectSlug) : undefined) ??
@@ -1202,7 +1777,6 @@ export async function runBurnPlaybook(input: {
   saveBurnRun(input.paseoHome, run);
 
   const execSupervisor = input.supervisorRunner ?? defaultSupervisorRunner;
-  const execGate = input.gateRunner ?? defaultGateRunner;
   let worktreeHostRoot = project.root;
   const isMockedRun = Boolean(input.supervisorRunner || input.openCodeRunner || input.scoutProbeRunner);
   const sleepAssertion = acquireSleepAssertion({ spawnProcess: !isMockedRun });
@@ -1245,7 +1819,7 @@ export async function runBurnPlaybook(input: {
       prompt: [
         `You are the strong Supervisor (${project.supervisorLane}) for Project ${project.name} (${project.root}).`,
         `Frame the ${input.playbook} Burn run for brief: ${input.prompt}`,
-        `Respond with JSON: {"goal": "...", "subtasks": ["..."], "gateCommand": "...", "citationRequired": boolean}`,
+        `Respond with JSON: {"goal": "...", "subtasks": ["..."], "gateCommand": "...", "artifact": "...", "scope": ["..."], "citationRequired": boolean}`,
       ].join("\n"),
       cwd: project.root,
       timeoutMs,
@@ -1255,10 +1829,16 @@ export async function runBurnPlaybook(input: {
       throw new Error(framingRes.error ?? framingRes.stderr ?? "Supervisor framing failed");
     }
 
+    const framingTargetRoot =
+      input.playbook === "self-evolve" && existsSync(DEFAULT_SELF_REPO_ROOT) && !input.projectSlug
+        ? DEFAULT_SELF_REPO_ROOT
+        : project.root;
+
     run.framing = parseFramingOutput(
       framingRes.stdout,
       input.playbook,
       input.prompt,
+      framingTargetRoot,
       input.gateCommand,
     );
     saveBurnRun(input.paseoHome, run);
@@ -1284,6 +1864,7 @@ export async function runBurnPlaybook(input: {
         role: m.roles[0] ?? "reader-1m",
         subtask: "Scout liveness, code-fix Gate, and Citation gate micro-battery",
         ok: m.healthy,
+        attemptCount: 1,
         latencyMs: m.latencyMs ?? 0,
         output: `healthy=${m.healthy} roles=[${m.roles.join(",")}] gate=${m.gatePassed} citation=${m.citationPassed}`,
         accepted: m.healthy && (m.gatePassed || m.citationPassed || m.roles.length > 0),
@@ -1308,52 +1889,27 @@ export async function runBurnPlaybook(input: {
           }
         }
       }
+      worktreeHostRoot = inspectRepoRoot;
 
-      const candidateRelPaths = [
-        "README.md",
-        "package.json",
-        "src/citation-gate.ts",
-        "src/free-pool.ts",
-        "src/burn-engine.ts",
-        "src/upstream.ts",
-        "src/index.ts",
-        "src/app.ts",
-      ];
-      if (existsSync(join(inspectRepoRoot, "src"))) {
-        try {
-          for (const f of readdirSync(join(inspectRepoRoot, "src")).sort()) {
-            const rel = `src/${f}`;
-            if (!candidateRelPaths.includes(rel)) candidateRelPaths.push(rel);
-          }
-        } catch {
-          // ignore
-        }
-      }
-      const repoExcerpts: string[] = [];
-      for (const rel of candidateRelPaths) {
-        if (repoExcerpts.length >= 4) break;
-        const abs = join(inspectRepoRoot, rel);
-        if (!existsSync(abs)) continue;
-        try {
-          if (!statSync(abs).isFile()) continue;
-          const rawContent = readFileSync(abs, "utf8").replace(/\r?\n$/, "");
-          const lines = rawContent.length === 0 ? [] : rawContent.split(/\r?\n/);
-          if (lines.length === 0) continue;
-          const maxExcerpt = Math.min(lines.length, 20);
-          const numbered = lines
-            .slice(0, maxExcerpt)
-            .map((line, i) => `${i + 1}: ${line}`)
-            .join("\n");
-          repoExcerpts.push(
-            `File ${rel} (total lines: 1-${lines.length}; valid citation example: [${rel}:1-${Math.min(lines.length, 3)}]):\n${numbered}`,
-          );
-        } catch {
-          // ignore unreadable file
-        }
-      }
+      const repoExcerpts = buildSmartRepoExcerpts(
+        inspectRepoRoot,
+        input.prompt,
+        run.framing?.subtasks ?? [],
+      );
 
       const effectiveGateCommand =
-        input.gateCommand ?? run.framing?.gateCommand ?? "node -e \"process.exit(0)\"";
+        input.gateCommand ??
+        run.framing?.gateCommand ??
+        inferDefaultGate(inspectRepoRoot, input.playbook);
+      const effectiveArtifact =
+        run.framing?.artifact ?? inferDefaultArtifact(inspectRepoRoot);
+
+      const factoryStateDir = join(artifactDir, "factory");
+      const runFactory = createFactory({
+        stateDir: factoryStateDir,
+        projectSlug: project.slug,
+        timeoutMs,
+      });
 
       const coderModels = selectSwarmModels(input.paseoHome, "coder", 1);
       const allReaders = selectSwarmModels(input.paseoHome, "reader-1m", 3);
@@ -1366,93 +1922,140 @@ export async function runBurnPlaybook(input: {
         ...coderModels.map((model) => ({ model, role: "coder" as SwarmRole })),
       ];
 
-      const rawAttempts = await Promise.all(
-        swarmAssignments.map(async ({ model, role }, idx) => {
+      const completedAttempts = await Promise.all(
+        swarmAssignments.map(async ({ model, role }, idx): Promise<BurnAttemptRecord> => {
           const attemptId = `attempt-${idx + 1}`;
           const subtask =
             role === "coder"
               ? `Build and verify runnable mini-PoC for: ${input.prompt}`
               : (run.framing?.subtasks[idx % (run.framing?.subtasks.length || 1)] ?? input.prompt);
 
-          let worktreeDir: string | undefined;
-          let branchName: string | undefined;
+          const basePromptLines = [
+            `You are a ${model.family} ${role} Free model in OSS Lab.`,
+            "Do not call any tools (do not call read, glob, grep, or bash). Answer directly from the file excerpts below.",
+            `Subtask: ${subtask}`,
+            `Inspected repository: ${inspectRepoRoot}`,
+            ...(role === "coder" ? [`Mini-PoC Gate command: ${effectiveGateCommand}`] : []),
+            `Every architectural claim MUST include exact [path:startLine-endLine] citations ONLY to the real files shown below within their valid line counts (e.g. [README.md:1-2]). Never write bracketed [path:line] for any other filename.`,
+            "",
+            ...repoExcerpts,
+          ];
+
           if (role === "coder") {
-            worktreeHostRoot = inspectRepoRoot;
-            const desiredBranch = `burn/${runId}/${modelBranchSlug(model.id)}`;
-            const wt = prepareIsolatedWorktree(
-              inspectRepoRoot,
-              join(artifactDir, "worktrees", attemptId),
-              desiredBranch,
-            );
-            worktreeDir = wt.worktreeDir;
-            branchName = wt.branchName;
+            return executeCoderAttemptWithFactory({
+              runFactory,
+              factoryStateDir,
+              projectSlug: project.slug,
+              runId,
+              playbook: input.playbook,
+              hostRoot: inspectRepoRoot,
+              artifactDir,
+              attemptId,
+              model,
+              subtask,
+              basePromptLines,
+              effectiveGateCommand,
+              artifact: effectiveArtifact,
+              scope: run.framing?.scope,
+              citationRequired: true,
+              maxAttempts: effectiveMaxAttempts,
+              timeoutMs,
+              openCodeRunner: input.openCodeRunner,
+              customGateRunner: input.gateRunner,
+            });
           }
 
-          const res = await runOpenCodeFreeModel({
-            model: model.id,
-            prompt: [
-              `You are a ${model.family} ${role} Free model in OSS Lab.`,
-              "Do not call any tools (do not call read, glob, grep, or bash). Answer directly from the file excerpts below.",
-              `Subtask: ${subtask}`,
-              `Inspected repository: ${inspectRepoRoot}`,
-              ...(role === "coder" ? [`Mini-PoC Gate command: ${effectiveGateCommand}`] : []),
-              `Every architectural claim MUST include exact [path:startLine-endLine] citations ONLY to the real files shown below within their valid line counts (e.g. [README.md:1-2]). Never write bracketed [path:line] for any other filename.`,
-              "",
-              ...repoExcerpts,
-            ].join("\n"),
-            cwd: worktreeDir ?? inspectRepoRoot,
-            timeoutMs,
-            runner: input.openCodeRunner,
-          });
+          // reader-1m attempt with citation self-repair rework loop
+          let attemptCount = 0;
+          let totalLatencyMs = 0;
+          let lastOutput = "";
+          let lastOk = false;
+          let citationResult: CitationGateResult = {
+            ok: false,
+            totalCitations: 0,
+            validCitations: [],
+            invalidCitations: [],
+          };
+          let gateResult: GateRunResult | undefined;
+          let accepted = false;
+          let rejectionReason: string | undefined;
+          let lastDiagnostic = "";
+
+          for (let tryNum = 1; tryNum <= effectiveMaxAttempts; tryNum++) {
+            attemptCount = tryNum;
+            const promptLines = [...basePromptLines];
+            if (tryNum > 1 && lastDiagnostic) {
+              promptLines.push(
+                "",
+                `REWORK_ATTEMPT (${tryNum}/${effectiveMaxAttempts}): Your previous response failed the Citation gate:`,
+                lastDiagnostic,
+                "Re-answer using ONLY valid [path:startLine-endLine] citations from the excerpts above.",
+              );
+            }
+
+            const res = await runOpenCodeFreeModel({
+              model: model.id,
+              prompt: promptLines.join("\n"),
+              cwd: inspectRepoRoot,
+              timeoutMs,
+              runner: input.openCodeRunner,
+            });
+            totalLatencyMs += res.latencyMs;
+            lastOutput = res.stdout;
+            lastOk = res.ok;
+
+            citationResult = verifyCitations(inspectRepoRoot, lastOutput);
+            if (input.gateCommand) {
+              const execGate = input.gateRunner ?? defaultGateRunner;
+              gateResult = await execGate({
+                command: effectiveGateCommand,
+                cwd: inspectRepoRoot,
+                timeoutMs,
+              });
+            }
+            const gateOk = gateResult ? gateResult.ok : true;
+            accepted = lastOk && citationResult.ok && gateOk;
+            if (accepted) {
+              rejectionReason = undefined;
+              break;
+            }
+
+            if (!lastOk) {
+              rejectionReason = "Free model invocation failed";
+              lastDiagnostic = res.error ?? res.stderr ?? rejectionReason;
+            } else if (!citationResult.ok) {
+              const detail =
+                citationResult.totalCitations === 0
+                  ? "0 citations found"
+                  : citationResult.invalidCitations.map((c) => `${c.raw} (${c.reason})`).join("; ");
+              rejectionReason = `Citation gate failed: ${detail}`;
+              lastDiagnostic = rejectionReason;
+            } else {
+              rejectionReason = `PoC Gate failed (exit ${gateResult?.exitCode ?? 1})`;
+              lastDiagnostic = rejectionReason;
+            }
+          }
+
           return {
             id: attemptId,
             model: model.id,
             family: model.family,
             role,
             subtask,
-            ok: res.ok,
-            latencyMs: res.latencyMs,
-            output: res.stdout,
-            worktreeDir,
-            branchName,
+            ok: lastOk,
+            attemptCount,
+            latencyMs: totalLatencyMs,
+            output: lastOutput,
+            citationResult,
+            gateResult,
+            accepted,
+            rejectionReason,
           };
         }),
       );
 
       transition("verifying");
-      for (const raw of rawAttempts) {
-        const citationResult = verifyCitations(inspectRepoRoot, raw.output);
-        let gateResult: GateRunResult | undefined;
-        if (raw.role === "coder" || input.gateCommand) {
-          gateResult = await execGate({
-            command: effectiveGateCommand,
-            cwd: raw.worktreeDir ?? inspectRepoRoot,
-            timeoutMs,
-          });
-        }
-        const gateOk = gateResult ? gateResult.ok : true;
-        const accepted = raw.ok && citationResult.ok && gateOk;
-        let rejectionReason: string | undefined;
-        if (!raw.ok) {
-          rejectionReason = "Free model invocation failed";
-        } else if (!citationResult.ok) {
-          const detail =
-            citationResult.totalCitations === 0
-              ? "0 citations found"
-              : citationResult.invalidCitations.map((c) => `${c.raw} (${c.reason})`).join("; ");
-          rejectionReason = `Citation gate failed: ${detail}`;
-        } else if (!gateOk) {
-          rejectionReason = `PoC Gate failed (exit ${gateResult?.exitCode ?? 1})`;
-        }
-
-        run.attempts.push({
-          ...raw,
-          citationResult,
-          gateResult,
-          accepted,
-          rejectionReason,
-        });
-      }
+      run.attempts.push(...completedAttempts);
 
       await runCouncilCrossCheck({
         paseoHome: input.paseoHome,
@@ -1474,9 +2077,17 @@ export async function runBurnPlaybook(input: {
       const winningCodeAttempt = winners.find((a) => a.branchName);
       if (winningCodeAttempt?.branchName) {
         run.winningBranch = winningCodeAttempt.branchName;
+        if (winningCodeAttempt.claimedCommit) {
+          run.winningCommit = winningCodeAttempt.claimedCommit;
+        }
+        run.landingStatus = "not_landed";
       }
 
-      finalizeWorktreeBranches(inspectRepoRoot, run.attempts, undefined);
+      finalizeWorktreeBranches(
+        inspectRepoRoot,
+        run.attempts,
+        inspectRepoRoot === project.root ? run.winningBranch : undefined,
+      );
       updateFreePoolStatsFromAttempts(input.paseoHome, run.attempts);
     } else {
       // proto-arena, night-shift, self-evolve
@@ -1489,66 +2100,57 @@ export async function runBurnPlaybook(input: {
       const gateCommand =
         input.gateCommand ??
         run.framing?.gateCommand ??
-        (input.playbook === "self-evolve"
-          ? "npm test && npm run check:bundle"
-          : "node -e \"process.exit(0)\"");
+        inferDefaultGate(arenaProjectRoot, input.playbook);
+      const effectiveArtifact =
+        run.framing?.artifact ?? inferDefaultArtifact(arenaProjectRoot);
 
-      const rawAttempts = await Promise.all(
-        swarmModels.map(async (model, idx) => {
+      const factoryStateDir = join(artifactDir, "factory");
+      const runFactory = createFactory({
+        stateDir: factoryStateDir,
+        projectSlug: project.slug,
+        timeoutMs,
+      });
+
+      const completedAttempts = await Promise.all(
+        swarmModels.map(async (model, idx): Promise<BurnAttemptRecord> => {
           const attemptId = `attempt-${idx + 1}`;
-          const desiredBranch = `burn/${runId}/${modelBranchSlug(model.id)}`;
-          const { worktreeDir, branchName } = prepareIsolatedWorktree(
-            arenaProjectRoot,
-            join(artifactDir, "worktrees", attemptId),
-            desiredBranch,
-          );
           const subtask =
             run.framing?.subtasks[idx % (run.framing?.subtasks.length || 1)] ?? input.prompt;
-          const res = await runOpenCodeFreeModel({
-            model: model.id,
-            prompt: [
-              `You are a ${model.family} coder Free model running playbook ${input.playbook}.`,
-              `Subtask: ${subtask}`,
-              `Gate command to satisfy: ${gateCommand}`,
-            ].join("\n"),
-            cwd: worktreeDir,
-            timeoutMs,
-            runner: input.openCodeRunner,
-          });
-          return {
-            id: attemptId,
-            model: model.id,
-            family: model.family,
-            role: "coder" as SwarmRole,
+          const basePromptLines = [
+            `You are a ${model.family} coder Free model running playbook ${input.playbook}.`,
+            `Subtask: ${subtask}`,
+            `Gate command to satisfy: ${gateCommand}`,
+            ...(run.framing?.scope && run.framing.scope.length > 0
+              ? [`Allowed file scope: ${run.framing.scope.join(", ")}`]
+              : []),
+          ];
+
+          return executeCoderAttemptWithFactory({
+            runFactory,
+            factoryStateDir,
+            projectSlug: project.slug,
+            runId,
+            playbook: input.playbook,
+            hostRoot: arenaProjectRoot,
+            artifactDir,
+            attemptId,
+            model,
             subtask,
-            ok: res.ok,
-            latencyMs: res.latencyMs,
-            output: res.stdout,
-            worktreeDir,
-            branchName,
-          };
+            basePromptLines,
+            effectiveGateCommand: gateCommand,
+            artifact: effectiveArtifact,
+            scope: run.framing?.scope,
+            citationRequired: Boolean(run.framing?.citationRequired),
+            maxAttempts: effectiveMaxAttempts,
+            timeoutMs,
+            openCodeRunner: input.openCodeRunner,
+            customGateRunner: input.gateRunner,
+          });
         }),
       );
 
       transition("verifying");
-      for (const raw of rawAttempts) {
-        const gateResult = await execGate({
-          command: gateCommand,
-          cwd: raw.worktreeDir,
-          timeoutMs,
-        });
-        const accepted = raw.ok && gateResult.ok;
-        run.attempts.push({
-          ...raw,
-          gateResult,
-          accepted,
-          rejectionReason: !raw.ok
-            ? "Free model invocation failed"
-            : !gateResult.ok
-              ? `Gate failed (exit ${gateResult.exitCode}): ${gateResult.stderr || gateResult.stdout}`
-              : undefined,
-        });
-      }
+      run.attempts.push(...completedAttempts);
 
       await runCouncilCrossCheck({
         paseoHome: input.paseoHome,
@@ -1568,6 +2170,10 @@ export async function runBurnPlaybook(input: {
         run.winningModel = winners[0].model;
         if (winners[0].branchName) {
           run.winningBranch = winners[0].branchName;
+          if (winners[0].claimedCommit) {
+            run.winningCommit = winners[0].claimedCommit;
+          }
+          run.landingStatus = "not_landed";
         }
       }
 
