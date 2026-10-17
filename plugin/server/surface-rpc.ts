@@ -31,12 +31,19 @@ import {
   scoutFreePool,
 } from "./core/free-pool.ts";
 import {
+  checkUnattendedPreflight,
+  openOsPermissionSettings,
+  runUnattendedWarmup,
+  type UnattendedPreflightState,
+} from "./core/preflight.ts";
+import {
   DEFAULT_UPSTREAM_ISSUES_DIR,
   fileUpstreamIssue,
   listUpstreamIssues,
 } from "./core/upstream.ts";
 import {
   burnDetail,
+  burnPreflight,
   burnProjectAdd,
   burnScout,
   burnSnapshot,
@@ -69,7 +76,11 @@ export interface BurnDaemonApi {
       filter?: { labels?: Record<string, string>; includeArchived?: boolean };
     }): Promise<{ entries: { agent: BurnDaemonAgentSnapshot }[] }>;
     create(options: {
-      config: { provider: string; thinkingOptionId?: string };
+      config: {
+        provider: string;
+        thinkingOptionId?: string;
+        featureValues?: Record<string, boolean>;
+      };
       cwd: string;
       title: string;
       labels: Record<string, string>;
@@ -95,6 +106,12 @@ export interface BurnSurfaceDeps {
   openCodeRunner?: OpenCodeRunner;
   gateRunner?: GateRunner;
   scoutProbeRunner?: ScoutProbeRunner;
+  preflightRunner?: (input: {
+    mode: "passive" | "warmup";
+    projectRoot?: string;
+    upstreamIssuesDir?: string;
+  }) => Promise<UnattendedPreflightState> | UnattendedPreflightState;
+  settingsOpener?: () => { ok: boolean; opened: string[]; error?: string };
   listOutput?: string;
   cachePath?: string;
   onLog?: (message: string) => void;
@@ -270,6 +287,20 @@ export function createBurnSurfaceHandlers(deps: BurnSurfaceDeps = {}) {
 
       const healthyModels = pool.models.filter((m) => m.healthy);
       const activeStatuses = new Set(["queued", "framing", "swarm-running", "verifying", "synthesizing"]);
+      const preflight = deps.preflightRunner
+        ? await deps.preflightRunner({
+            mode: "passive",
+            projectRoot: activeProject?.root,
+            upstreamIssuesDir,
+          })
+        : checkUnattendedPreflight({
+            projectRoot: activeProject?.root,
+            upstreamIssuesDir,
+            ...(deps.openCodeRunner || deps.scoutProbeRunner
+              ? { openCodeChecker: () => true }
+              : {}),
+          });
+
       const view: BurnLabView = {
         version: BURN_VIEW_VERSION,
         stateDir,
@@ -299,9 +330,77 @@ export function createBurnSurfaceHandlers(deps: BurnSurfaceDeps = {}) {
         runs: runsToShow.map(summarizeRun),
         upstreamIssues,
         daemonError,
+        preflight,
       };
 
       return { ok: true as const, view };
+    },
+
+    async preflight(
+      input: {
+        mode?: "warmup" | "open-settings";
+        projectSlug?: string;
+        projectRoot?: string;
+      } = {},
+      _context?: BurnCallContext,
+    ) {
+      const mode = input.mode ?? "warmup";
+      const projects = resolveBurnProjects(paseoHome, {
+        includeSelfRepo: deps.includeSelfRepo,
+        selfRepoRoot: deps.selfRepoRoot,
+      });
+      const activeProject = pickActiveProject(projects, input);
+      const targetRoot = input.projectRoot ?? activeProject?.root;
+
+      try {
+        if (mode === "open-settings") {
+          const openRes = deps.settingsOpener
+            ? deps.settingsOpener()
+            : openOsPermissionSettings();
+          if (!openRes.ok) {
+            return failure("open-settings-failed", openRes.error ?? "failed to open OS settings");
+          }
+          const preflight = deps.preflightRunner
+            ? await deps.preflightRunner({
+                mode: "passive",
+                projectRoot: targetRoot,
+                upstreamIssuesDir,
+              })
+            : checkUnattendedPreflight({
+                projectRoot: targetRoot,
+                upstreamIssuesDir,
+              });
+          return {
+            ok: true as const,
+            mode,
+            preflight,
+            opened: openRes.opened,
+          };
+        }
+
+        const preflight = deps.preflightRunner
+          ? await deps.preflightRunner({
+              mode: "warmup",
+              projectRoot: targetRoot,
+              upstreamIssuesDir,
+            })
+          : await runUnattendedWarmup({
+              projectRoot: targetRoot,
+              upstreamIssuesDir,
+              skipNetworkProbe: Boolean(deps.openCodeRunner || deps.supervisorRunner),
+            });
+
+        return {
+          ok: true as const,
+          mode,
+          preflight,
+        };
+      } catch (err) {
+        return failure(
+          "preflight-failed",
+          err instanceof Error ? err.message : String(err),
+        );
+      }
     },
 
     async projectAdd(
@@ -385,6 +484,13 @@ export function createBurnSurfaceHandlers(deps: BurnSurfaceDeps = {}) {
           openCodeRunner: deps.openCodeRunner,
           gateRunner: deps.gateRunner,
           scoutProbeRunner: deps.scoutProbeRunner,
+          preflightRunner: deps.preflightRunner
+            ? () =>
+                deps.preflightRunner!({
+                  mode: "warmup",
+                  upstreamIssuesDir,
+                })
+            : undefined,
           listOutput: deps.listOutput,
           cachePath: deps.cachePath,
         });
@@ -494,8 +600,15 @@ export function createBurnSurfaceHandlers(deps: BurnSurfaceDeps = {}) {
         try {
           const handle = await daemon.agents.create({
             config: parsedLane.thinking
-              ? { provider: parsedLane.providerSpec, thinkingOptionId: parsedLane.thinking }
-              : { provider: parsedLane.providerSpec },
+              ? {
+                  provider: parsedLane.providerSpec,
+                  thinkingOptionId: parsedLane.thinking,
+                  featureValues: { auto_accept: true },
+                }
+              : {
+                  provider: parsedLane.providerSpec,
+                  featureValues: { auto_accept: true },
+                },
             cwd: project.root,
             title: "Factory Supervisor",
             labels: { seat: "supervisor", project: project.slug },
@@ -549,6 +662,9 @@ export function registerBurnSurfaceRpc(
 ): void {
   server.handle(burnSnapshot, (input, context) =>
     handlers.snapshot(input, { paseo: context.paseo }),
+  );
+  server.handle(burnPreflight, (input, context) =>
+    handlers.preflight(input, { paseo: context.paseo }),
   );
   server.handle(burnScout, (input, context) =>
     handlers.scout(input, { paseo: context.paseo }),

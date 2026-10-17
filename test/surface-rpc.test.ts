@@ -243,12 +243,17 @@ test("burn.supervisor.open creates or reuses the Project's Supervisor seat agent
           return { entries };
         },
         async create(options: {
-          config: { provider: string; thinkingOptionId?: string };
+          config: {
+            provider: string;
+            thinkingOptionId?: string;
+            featureValues?: Record<string, boolean>;
+          };
           cwd: string;
           title: string;
           labels: Record<string, string>;
           prompt?: string;
         }) {
+          assert.equal(options.config.featureValues?.auto_accept, true);
           const id = `agent-sup-${createdAgents.length + 1}`;
           createdAgents.push({
             id,
@@ -317,6 +322,75 @@ test("burn.supervisor.open creates or reuses the Project's Supervisor seat agent
   }
 });
 
+test("burn.preflight runs warmup and open-settings, and burn.start fails fast if ShipIt stale binary is detected", async () => {
+  const paseoHome = mkdtempSync(join(tmpdir(), "burn-surface-pf-home-"));
+  const repoDir = mkdtempSync(join(tmpdir(), "burn-surface-pf-repo-"));
+
+  try {
+    initTempGitRepo(repoDir);
+    let simulateShipIt = false;
+    const handlers = createBurnSurfaceHandlers({
+      paseoHome,
+      includeSelfRepo: false,
+      preflightRunner: ({ mode }) => ({
+        platform: "darwin",
+        ready: !simulateShipIt,
+        responsibleBundle: "sh.paseo.desktop.helper (Paseo Helper.app)",
+        fullDiskAccessGranted: true,
+        shipItStaleBinary: simulateShipIt,
+        projectRootAccessible: true,
+        projectInProtectedFolder: false,
+        worktreeJunctionReady: true,
+        openCodeAutoReady: true,
+        sleepAssertionActive: mode === "warmup",
+        issues: simulateShipIt
+          ? ["ShipIt unlinked the running daemon binary. Restart Paseo / daemon."]
+          : [],
+        checkedAt: new Date().toISOString(),
+      }),
+      settingsOpener: () => ({
+        ok: true,
+        opened: ["x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles"],
+      }),
+    });
+
+    const warmupRes = await handlers.preflight({ mode: "warmup" });
+    assert.equal(warmupRes.ok, true);
+    if (warmupRes.ok) {
+      assert.equal(warmupRes.mode, "warmup");
+      assert.equal(warmupRes.preflight.ready, true);
+    }
+
+    const openRes = await handlers.preflight({ mode: "open-settings" });
+    assert.equal(openRes.ok, true);
+    if (openRes.ok) {
+      assert.equal(openRes.mode, "open-settings");
+      assert.equal(openRes.opened?.length, 1);
+    }
+
+    // Now simulate a stale ShipIt binary and verify burn.start fails fast
+    simulateShipIt = true;
+    const added = await handlers.projectAdd({ repoPath: repoDir, name: "PF Repo" });
+    assert.equal(added.ok, true);
+    if (!added.ok) return;
+
+    const failedStart = await handlers.start({
+      playbook: "night-shift",
+      prompt: "Audit edge cases",
+      projectSlug: added.project.slug,
+      awaitCompletion: true,
+    });
+    assert.equal(failedStart.ok, true);
+    if (failedStart.ok) {
+      assert.equal(failedStart.run.status, "failed");
+      assert.match(failedStart.run.error ?? "", /ShipIt/);
+    }
+  } finally {
+    rmSync(paseoHome, { recursive: true, force: true });
+    rmSync(repoDir, { recursive: true, force: true });
+  }
+});
+
 test("createBurnSurfaceHandlers defaults to trial home ~/.paseo-factory when present and renders live state cleanly", async () => {
   const trialHome = join(homedir(), ".paseo-factory");
   const configPath = join(trialHome, "config.json");
@@ -326,11 +400,7 @@ test("createBurnSurfaceHandlers defaults to trial home ~/.paseo-factory when pre
     plugins?: Record<string, { source?: string; path?: string; enabled?: boolean }>;
   };
   assert.ok(config.plugins?.["paseo-factory"], `expected paseo-factory in ${configPath}`);
-  assert.deepEqual(config.plugins?.["factory-burn-lab"], {
-    source: "directory",
-    path: "/Users/andrewpham/Documents/code/self-project/factory-burn-lab/plugin",
-    enabled: true,
-  });
+  assert.equal(config.plugins?.["factory-burn-lab"]?.enabled, true);
 
   const handlers = createBurnSurfaceHandlers({});
   const snap = await handlers.snapshot({});
@@ -351,10 +421,12 @@ test("createBurnSurfaceHandlers defaults to trial home ~/.paseo-factory when pre
   );
   assert.equal(snap.view.kpis.totalRuns >= 1, true);
   assert.equal(snap.view.kpis.upstreamIssues >= 1, true);
+  assert.ok(snap.view.preflight);
   const issue01 = snap.view.upstreamIssues.find((i) => i.number === "01");
   assert.ok(issue01);
   assert.equal(issue01.status, "needs-triage");
   assert.equal(existsSync(join(trialHome, "factory", "ledger.jsonl")), false);
 });
+
 
 

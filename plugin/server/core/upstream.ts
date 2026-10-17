@@ -1,8 +1,66 @@
 import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { homedir } from "node:os";
+import { dirname, join, resolve } from "node:path";
 
-export const DEFAULT_UPSTREAM_ISSUES_DIR =
-  "/Users/andrewpham/Documents/code/self-project/research-slp/.scratch/burn-lab-upstream/issues";
+export function resolveDefaultSelfRepoRoot(
+  cwd: string = process.cwd(),
+  home: string = homedir(),
+  env: NodeJS.ProcessEnv = process.env,
+): string {
+  if (env.BURN_LAB_SELF_REPO_ROOT?.trim()) {
+    return resolve(env.BURN_LAB_SELF_REPO_ROOT.trim());
+  }
+
+  let cursor = resolve(cwd);
+  for (let i = 0; i < 6; i++) {
+    const pkgPath = join(cursor, "package.json");
+    if (existsSync(pkgPath)) {
+      try {
+        const pkg = JSON.parse(readFileSync(pkgPath, "utf8")) as { name?: string };
+        if (pkg.name === "factory-burn-lab") {
+          return cursor;
+        }
+      } catch {
+        // ignore
+      }
+    }
+    const parent = dirname(cursor);
+    if (parent === cursor) break;
+    cursor = parent;
+  }
+
+  const candidates = [
+    join(home, "code", "factory-burn-lab"),
+    join(home, "code", "self-project", "factory-burn-lab"),
+    join(home, "Documents", "code", "self-project", "factory-burn-lab"),
+    join(home, "Documents", "code", "factory-burn-lab"),
+  ];
+  for (const candidate of candidates) {
+    if (existsSync(candidate)) {
+      return candidate;
+    }
+  }
+  return candidates[2]!;
+}
+
+export function resolveDefaultUpstreamIssuesDir(
+  selfRepoRoot: string = resolveDefaultSelfRepoRoot(),
+  env: NodeJS.ProcessEnv = process.env,
+): string {
+  if (env.BURN_LAB_UPSTREAM_ISSUES_DIR?.trim()) {
+    return resolve(env.BURN_LAB_UPSTREAM_ISSUES_DIR.trim());
+  }
+  const parentDir = dirname(resolve(selfRepoRoot));
+  const paseoFactorySibling = join(parentDir, "paseo-factory");
+  const researchSlpSibling = join(parentDir, "research-slp");
+  const upstreamRepo =
+    existsSync(paseoFactorySibling) && !existsSync(researchSlpSibling)
+      ? paseoFactorySibling
+      : researchSlpSibling;
+  return join(upstreamRepo, ".scratch", "burn-lab-upstream", "issues");
+}
+
+export const DEFAULT_UPSTREAM_ISSUES_DIR = resolveDefaultUpstreamIssuesDir();
 
 export interface UpstreamIssue {
   id: string;

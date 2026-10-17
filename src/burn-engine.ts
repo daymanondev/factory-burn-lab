@@ -27,8 +27,14 @@ import {
   type SwarmRole,
 } from "./free-pool.ts";
 import {
+  acquireSleepAssertion,
+  runUnattendedWarmup,
+  type UnattendedPreflightState,
+} from "./preflight.ts";
+import {
   DEFAULT_UPSTREAM_ISSUES_DIR,
   fileUpstreamIssue,
+  resolveDefaultSelfRepoRoot,
   type UpstreamIssue,
 } from "./upstream.ts";
 
@@ -53,8 +59,7 @@ export type BurnRunStatus =
 
 export const DEFAULT_SUPERVISOR_LANE = "pi/zai/glm-5.3";
 
-export const DEFAULT_SELF_REPO_ROOT =
-  "/Users/andrewpham/Documents/code/self-project/factory-burn-lab";
+export const DEFAULT_SELF_REPO_ROOT = resolveDefaultSelfRepoRoot();
 
 export interface BurnProject {
   slug: string;
@@ -609,10 +614,14 @@ function defaultGateRunner(input: {
   timeoutMs: number;
 }): Promise<GateRunResult> {
   return new Promise((resolvePromise) => {
-    const child = spawn("sh", ["-c", input.command], {
+    const isWin = process.platform === "win32";
+    const shellCmd = isWin ? process.env.ComSpec || "cmd.exe" : "sh";
+    const shellArgs = isWin ? ["/d", "/s", "/c", input.command] : ["-c", input.command];
+    const child = spawn(shellCmd, shellArgs, {
       cwd: input.cwd,
       env: buildExtendedPathEnv(),
       stdio: ["ignore", "pipe", "pipe"],
+      windowsHide: true,
     });
 
     let stdout = "";
@@ -1055,7 +1064,11 @@ function prepareIsolatedWorktree(
   const destNodeModules = join(destDir, "node_modules");
   if (existsSync(parentNodeModules) && !existsSync(destNodeModules)) {
     try {
-      symlinkSync(parentNodeModules, destNodeModules, "dir");
+      symlinkSync(
+        parentNodeModules,
+        destNodeModules,
+        process.platform === "win32" ? "junction" : "dir",
+      );
     } catch {
       // ignore symlink failure
     }
@@ -1156,6 +1169,7 @@ export async function runBurnPlaybook(input: {
   openCodeRunner?: OpenCodeRunner;
   gateRunner?: GateRunner;
   scoutProbeRunner?: ScoutProbeRunner;
+  preflightRunner?: () => Promise<UnattendedPreflightState> | UnattendedPreflightState;
   listOutput?: string;
   cachePath?: string;
   timeoutMs?: number;
@@ -1208,8 +1222,37 @@ export async function runBurnPlaybook(input: {
   const execSupervisor = input.supervisorRunner ?? defaultSupervisorRunner;
   const execGate = input.gateRunner ?? defaultGateRunner;
   let worktreeHostRoot = project.root;
+  const isMockedRun = Boolean(input.supervisorRunner || input.openCodeRunner || input.scoutProbeRunner);
+  const sleepAssertion = acquireSleepAssertion({ spawnProcess: !isMockedRun });
 
   try {
+    // Tier 0: Unattended Preflight & Eager Folder Access Check
+    if (input.preflightRunner) {
+      const preflight = await input.preflightRunner();
+      if (preflight.shipItStaleBinary || !preflight.projectRootAccessible) {
+        throw new Error(
+          preflight.issues[0] ?? "Unattended preflight failed before starting Burn run",
+        );
+      }
+    } else if (!isMockedRun) {
+      const preflight = await runUnattendedWarmup({
+        projectRoot: project.root,
+        upstreamIssuesDir: input.upstreamIssuesDir ?? DEFAULT_UPSTREAM_ISSUES_DIR,
+        skipNetworkProbe: true,
+      });
+      if (preflight.shipItStaleBinary || !preflight.projectRootAccessible) {
+        throw new Error(
+          preflight.issues[0] ?? "Unattended preflight failed before starting Burn run",
+        );
+      }
+    } else if (existsSync(project.root)) {
+      readdirSync(project.root);
+      const nmDir = join(project.root, "node_modules");
+      if (existsSync(nmDir)) {
+        readdirSync(nmDir);
+      }
+    }
+
     // Tier 1: Strong Supervisor Framing
     transition("framing");
     const framingRes = await execSupervisor({
@@ -1619,5 +1662,7 @@ export async function runBurnPlaybook(input: {
     run.error = err instanceof Error ? err.message : String(err);
     transition("failed");
     return run;
+  } finally {
+    sleepAssertion.release();
   }
 }

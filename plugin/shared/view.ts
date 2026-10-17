@@ -156,6 +156,22 @@ export const BurnKpisSchema = z.object({
 });
 export type BurnKpis = z.infer<typeof BurnKpisSchema>;
 
+export const UnattendedPreflightViewSchema = z.object({
+  platform: z.enum(["darwin", "win32", "linux", "other"]),
+  ready: z.boolean(),
+  responsibleBundle: z.string(),
+  fullDiskAccessGranted: z.boolean().nullable(),
+  shipItStaleBinary: z.boolean(),
+  projectRootAccessible: z.boolean(),
+  projectInProtectedFolder: z.boolean(),
+  worktreeJunctionReady: z.boolean(),
+  openCodeAutoReady: z.boolean(),
+  sleepAssertionActive: z.boolean(),
+  issues: z.array(z.string()),
+  checkedAt: z.string(),
+});
+export type UnattendedPreflightView = z.infer<typeof UnattendedPreflightViewSchema>;
+
 export const BurnLabViewSchema = z.object({
   version: z.literal(BURN_VIEW_VERSION),
   stateDir: z.string(),
@@ -171,5 +187,6 @@ export const BurnLabViewSchema = z.object({
   runs: z.array(BurnRunSummaryViewSchema),
   upstreamIssues: z.array(UpstreamIssueViewSchema),
   daemonError: z.string().nullable(),
+  preflight: UnattendedPreflightViewSchema.optional(),
 });
 export type BurnLabView = z.infer<typeof BurnLabViewSchema>;
