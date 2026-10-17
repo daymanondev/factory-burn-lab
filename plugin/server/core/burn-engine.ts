@@ -404,12 +404,53 @@ function parseProjectEntry(
   };
 }
 
+function readCustomProjectNames(paseoHome: string): {
+  bySlug: Map<string, string>;
+  byRoot: Map<string, string>;
+} {
+  const bySlug = new Map<string, string>();
+  const byRoot = new Map<string, string>();
+  const filePath = burnLabProjectsPath(paseoHome);
+  if (!existsSync(filePath)) return { bySlug, byRoot };
+  try {
+    const parsed = JSON.parse(readFileSync(filePath, "utf8")) as unknown;
+    for (const item of unwrapProjectListJson(parsed)) {
+      const name =
+        (typeof item.name === "string" && item.name.trim()) ||
+        (typeof item.customName === "string" && item.customName.trim()) ||
+        (typeof item.displayName === "string" && item.displayName.trim()) ||
+        "";
+      if (!name) continue;
+      if (typeof item.slug === "string" && item.slug.trim()) {
+        bySlug.set(item.slug.trim(), name);
+      }
+      if (typeof item.root === "string" && item.root.trim()) {
+        byRoot.set(item.root.trim(), name);
+      }
+    }
+  } catch {
+    // ignore malformed json
+  }
+  return { bySlug, byRoot };
+}
+
 export function resolveBurnProjects(
   paseoHome: string,
   options?: { includeSelfRepo?: boolean; selfRepoRoot?: string },
 ): BurnProject[] {
   const bySlug = new Map<string, BurnProject>();
   const byRoot = new Set<string>();
+  const customNames = readCustomProjectNames(paseoHome);
+  const customNameFor = (
+    slug?: string,
+    root?: string,
+    explicitName?: unknown,
+  ): string | undefined => {
+    if (typeof explicitName === "string" && explicitName.trim()) return explicitName.trim();
+    if (slug && customNames.bySlug.has(slug)) return customNames.bySlug.get(slug);
+    if (root && customNames.byRoot.has(root)) return customNames.byRoot.get(root);
+    return undefined;
+  };
 
   const register = (proj: BurnProject | null) => {
     if (!proj) return;
@@ -422,7 +463,7 @@ export function resolveBurnProjects(
     for (const reg of listProjectRegistrations(stateDir)) {
       register(
         parseProjectEntry(
-          { slug: reg.slug, root: reg.root, name: reg.name },
+          { slug: reg.slug, root: reg.root, name: customNameFor(reg.slug, reg.root) },
           paseoHome,
           "paseo-factory",
           reg.slug,
@@ -435,7 +476,7 @@ export function resolveBurnProjects(
       const reg = readProjectRegistration(stateDir, disc.slug);
       register(
         parseProjectEntry(
-          { slug: disc.slug, root: disc.root, name: reg?.name },
+          { slug: disc.slug, root: disc.root, name: customNameFor(disc.slug, disc.root) },
           paseoHome,
           reg ? "paseo-factory" : "paseo",
           disc.slug,
@@ -451,25 +492,51 @@ export function resolveBurnProjects(
         const st = statSync(fullPath);
         if (st.isFile() && entryName.endsWith(".json")) {
           const raw = JSON.parse(readFileSync(fullPath, "utf8")) as Record<string, unknown>;
+          const fallbackSlug = entryName.replace(/\.json$/i, "");
           register(
             parseProjectEntry(
-              raw,
+              {
+                ...raw,
+                name: customNameFor(
+                  typeof raw.slug === "string" ? raw.slug : fallbackSlug,
+                  typeof raw.root === "string" ? raw.root : undefined,
+                  raw.name,
+                ),
+              },
               paseoHome,
               "paseo-factory",
-              entryName.replace(/\.json$/i, ""),
+              fallbackSlug,
             ),
           );
         } else if (st.isDirectory()) {
           const projectJson = join(fullPath, "project.json");
           if (existsSync(projectJson)) {
             const raw = JSON.parse(readFileSync(projectJson, "utf8")) as Record<string, unknown>;
-            register(parseProjectEntry(raw, paseoHome, "paseo-factory", entryName));
+            register(
+              parseProjectEntry(
+                {
+                  ...raw,
+                  name: customNameFor(
+                    entryName,
+                    typeof raw.root === "string" ? raw.root : undefined,
+                    raw.name,
+                  ),
+                },
+                paseoHome,
+                "paseo-factory",
+                entryName,
+              ),
+            );
           } else {
             const ledgerRoot = extractRootFromLedgerIfPresent(join(fullPath, "ledger.jsonl"));
             if (ledgerRoot) {
               register(
                 parseProjectEntry(
-                  { slug: entryName, root: ledgerRoot },
+                  {
+                    slug: entryName,
+                    root: ledgerRoot,
+                    name: customNameFor(entryName, ledgerRoot),
+                  },
                   paseoHome,
                   "paseo-factory",
                   entryName,
@@ -601,14 +668,33 @@ export function addBurnProject(
     const projectName = options?.name?.trim() || basename(identity.root);
     writeProjectRegistration(factoryStateDir, identity.slug, {
       root: identity.root,
-      name: projectName,
     });
     const reg = readProjectRegistration(factoryStateDir, identity.slug);
 
+    const metaPath = burnLabProjectsPath(paseoHome);
+    let existingList: Record<string, unknown>[] = [];
+    if (existsSync(metaPath)) {
+      try {
+        existingList = unwrapProjectListJson(JSON.parse(readFileSync(metaPath, "utf8")));
+      } catch {
+        existingList = [];
+      }
+    }
+    const filteredList = existingList.filter(
+      (item) => item.slug !== identity.slug && item.root !== identity.root,
+    );
+    filteredList.push({
+      slug: identity.slug,
+      name: projectName,
+      root: identity.root,
+    });
+    mkdirSync(dirname(metaPath), { recursive: true });
+    writeFileSync(metaPath, `${JSON.stringify(filteredList, null, 2)}\n`, "utf8");
+
     const project: BurnProject = {
       slug: identity.slug,
-      name: reg?.name || projectName,
-      root: identity.root,
+      name: projectName,
+      root: reg?.root ?? identity.root,
       gitCommonDir: identity.gitCommonDir,
       supervisorLane: resolveSupervisorLane(paseoHome, identity.slug),
       source: "paseo-factory",
@@ -1190,12 +1276,21 @@ export function pickCrossFamilyReviewers(
   return selected;
 }
 
+function formatCitationGateFailure(citationResult: CitationGateResult): string {
+  const detail =
+    citationResult.totalCitations === 0
+      ? "0 citations found"
+      : citationResult.invalidCitations.map((c) => `${c.raw} (${c.reason})`).join("; ");
+  return `Citation gate failed: ${detail}`;
+}
+
 async function runCouncilCrossCheck(input: {
   paseoHome: string;
   playbook: BurnPlaybook;
   cwd: string;
   timeoutMs: number;
   openCodeRunner?: OpenCodeRunner;
+  framing?: BurnFramingPlan;
   attempts: BurnAttemptRecord[];
   councilNotes: BurnCouncilNote[];
 }): Promise<void> {
@@ -1203,6 +1298,10 @@ async function runCouncilCrossCheck(input: {
     (q, idx) =>
       `${idx + 1}. ${q.name} — ${q.instructions}\n   - CHALLENGE if: ${q.criteria.true}\n   - CLEAR if: ${q.criteria.false}`,
   ).join("\n");
+  const contractArtifact = input.framing?.artifact || inferDefaultArtifact(input.cwd);
+  const contractScope = input.framing?.scope?.length
+    ? input.framing.scope.join(", ")
+    : "(unrestricted)";
 
   for (const attempt of input.attempts.filter((a) => a.accepted)) {
     const reviewers = pickCrossFamilyReviewers(
@@ -1241,8 +1340,9 @@ async function runCouncilCrossCheck(input: {
             "Do not call any tools (do not call read, glob, grep, or bash).",
             `Cross-examine the following ${input.playbook} attempt (${attempt.id}) from ${attempt.model} (family=${attempt.family}):`,
             `Subtask: ${attempt.subtask}`,
+            `CONTRACT: artifact=${contractArtifact}, scope=${contractScope}`,
             "",
-            "WORKER_OUTPUT:",
+            "ATTEMPT_OUTPUT:",
             attempt.output,
             ...diffSection,
             ...gateSection,
@@ -1286,39 +1386,16 @@ function modelBranchSlug(modelId: string): string {
   return shortId.replace(/[^a-zA-Z0-9._-]+/g, "-").replace(/^-+|-+$/g, "") || "model";
 }
 
-function prepareIsolatedWorktree(
-  projectRoot: string,
-  destDir: string,
-  branchName: string,
-): { worktreeDir: string; branchName?: string } {
-  mkdirSync(dirname(destDir), { recursive: true });
-  const upstreamFactoryRoot = resolve(DEFAULT_UPSTREAM_ISSUES_DIR, "../../..");
-  const isUpstreamFactoryRepo = resolve(projectRoot) === upstreamFactoryRoot;
-  let createdBranch: string | undefined;
-  if (!isUpstreamFactoryRepo) {
-    try {
-      execFileSync("git", ["worktree", "add", "-B", branchName, destDir, "HEAD"], {
-        cwd: projectRoot,
-        env: buildExtendedPathEnv(),
-        stdio: "ignore",
-        timeout: 10_000,
-      });
-      createdBranch = branchName;
-    } catch {
-      // fall back to directory copy below
-    }
-  }
-  if (!createdBranch) {
-    mkdirSync(destDir, { recursive: true });
-    if (existsSync(projectRoot)) {
-      cpSync(projectRoot, destDir, {
-        recursive: true,
-        filter: (src) => {
-          const base = basename(src);
-          return base !== "node_modules" && base !== ".git";
-        },
-      });
-    }
+function prepareFallbackCopyDir(projectRoot: string, destDir: string): string {
+  mkdirSync(destDir, { recursive: true });
+  if (existsSync(projectRoot)) {
+    cpSync(projectRoot, destDir, {
+      recursive: true,
+      filter: (src) => {
+        const base = basename(src);
+        return base !== "node_modules" && base !== ".git";
+      },
+    });
   }
 
   const parentNodeModules = join(projectRoot, "node_modules");
@@ -1334,7 +1411,7 @@ function prepareIsolatedWorktree(
       // ignore symlink failure
     }
   }
-  return { worktreeDir: destDir, branchName: createdBranch };
+  return destDir;
 }
 
 function commitWorktreeChanges(
@@ -1420,16 +1497,20 @@ async function executeCoderAttemptWithFactory(input: {
   const baseCommit = headCommitSync(input.hostRoot);
   const desiredBranch = `burn/${input.runId}/${modelBranchSlug(input.model.id)}`;
   const desiredWorktreeDir = join(input.artifactDir, "worktrees", input.attemptId);
+  const upstreamFactoryRoot = resolve(DEFAULT_UPSTREAM_ISSUES_DIR, "../../..");
+  const isUpstreamFactoryRepo = resolve(input.hostRoot) === upstreamFactoryRoot;
 
-  const prepared = prepareTaskWorktree({
-    stateDir: input.factoryStateDir,
-    workspace: input.hostRoot,
-    task: input.attemptId,
-    base: baseCommit,
-    worktreePath: desiredWorktreeDir,
-    branchName: desiredBranch,
-    symlinkNodeModules: true,
-  });
+  const prepared = isUpstreamFactoryRepo
+    ? ({ ok: false as const, reason: "upstream factory repo is read-only" })
+    : prepareTaskWorktree({
+        stateDir: input.factoryStateDir,
+        workspace: input.hostRoot,
+        task: input.attemptId,
+        base: baseCommit,
+        worktreePath: desiredWorktreeDir,
+        branchName: desiredBranch,
+        symlinkNodeModules: true,
+      });
 
   let worktreeDir: string;
   let branchName: string | undefined;
@@ -1437,9 +1518,8 @@ async function executeCoderAttemptWithFactory(input: {
     worktreeDir = prepared.path;
     branchName = prepared.branch;
   } else {
-    const fallback = prepareIsolatedWorktree(input.hostRoot, desiredWorktreeDir, desiredBranch);
-    worktreeDir = fallback.worktreeDir;
-    branchName = fallback.branchName;
+    worktreeDir = prepareFallbackCopyDir(input.hostRoot, desiredWorktreeDir);
+    branchName = undefined;
   }
 
   const wtHead = headCommitSync(worktreeDir);
@@ -1591,11 +1671,7 @@ async function executeCoderAttemptWithFactory(input: {
       rejectionReason = "Free model invocation failed";
       lastDiagnostic = res.error ?? res.stderr ?? "Free model invocation failed";
     } else if (citationResult && !citationResult.ok) {
-      const detail =
-        citationResult.totalCitations === 0
-          ? "0 citations found"
-          : citationResult.invalidCitations.map((c) => `${c.raw} (${c.reason})`).join("; ");
-      rejectionReason = `Citation gate failed: ${detail}`;
+      rejectionReason = formatCitationGateFailure(citationResult);
       lastDiagnostic = rejectionReason;
     } else {
       const noteDetail =
@@ -1707,6 +1783,20 @@ function updateFreePoolStatsFromAttempts(paseoHome: string, attempts: BurnAttemp
   }
 }
 
+function resolveTargetBurnProject(paseoHome: string, projectSlug?: string): BurnProject {
+  const projects = resolveBurnProjects(paseoHome);
+  return (
+    (projectSlug ? projects.find((p) => p.slug === projectSlug) : undefined) ??
+    projects[0] ?? {
+      slug: "factory-burn-lab-default",
+      name: "factory-burn-lab",
+      root: DEFAULT_SELF_REPO_ROOT,
+      supervisorLane: resolveSupervisorLane(paseoHome, projectSlug),
+      source: "burn-lab",
+    }
+  );
+}
+
 export function allocateBurnRunRecord(input: {
   paseoHome: string;
   playbook: BurnPlaybook;
@@ -1716,16 +1806,7 @@ export function allocateBurnRunRecord(input: {
   gateCommand?: string;
   runId?: string;
 }): BurnRunRecord {
-  const projects = resolveBurnProjects(input.paseoHome);
-  const project: BurnProject =
-    (input.projectSlug ? projects.find((p) => p.slug === input.projectSlug) : undefined) ??
-    projects[0] ?? {
-      slug: "factory-burn-lab-default",
-      name: "factory-burn-lab",
-      root: DEFAULT_SELF_REPO_ROOT,
-      supervisorLane: resolveSupervisorLane(input.paseoHome, input.projectSlug),
-      source: "burn-lab",
-    };
+  const project = resolveTargetBurnProject(input.paseoHome, input.projectSlug);
 
   const runId =
     input.runId ?? `burn-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
@@ -1874,16 +1955,7 @@ export async function runBurnPlaybook(input: {
 }): Promise<BurnRunRecord> {
   const timeoutMs = input.timeoutMs ?? 45_000;
   const effectiveMaxAttempts = Math.max(1, Math.min(MAX_ATTEMPTS, input.maxAttempts ?? 2));
-  const projects = resolveBurnProjects(input.paseoHome);
-  const project: BurnProject =
-    (input.projectSlug ? projects.find((p) => p.slug === input.projectSlug) : undefined) ??
-    projects[0] ?? {
-      slug: "factory-burn-lab-default",
-      name: "factory-burn-lab",
-      root: DEFAULT_SELF_REPO_ROOT,
-      supervisorLane: resolveSupervisorLane(input.paseoHome, input.projectSlug),
-      source: "burn-lab",
-    };
+  const project = resolveTargetBurnProject(input.paseoHome, input.projectSlug);
 
   const preAllocated = input.runId ? loadBurnRun(input.paseoHome, input.runId) : null;
   const run: BurnRunRecord =
@@ -2011,7 +2083,10 @@ export async function runBurnPlaybook(input: {
       let inspectRepoRoot = project.root;
       if (input.targetRepo) {
         if (existsSync(input.targetRepo)) {
-          inspectRepoRoot = resolve(input.targetRepo);
+          const targetIdentity = resolveProjectIdentity(input.targetRepo);
+          inspectRepoRoot = targetIdentity.ok
+            ? targetIdentity.root
+            : realpathSync.native(resolve(input.targetRepo));
         } else if (/^(?:https?:\/\/|git@)/i.test(input.targetRepo)) {
           const cloneDir = join(artifactDir, "oss-repo");
           try {
@@ -2161,11 +2236,7 @@ export async function runBurnPlaybook(input: {
               rejectionReason = "Free model invocation failed";
               lastDiagnostic = res.error ?? res.stderr ?? rejectionReason;
             } else if (!citationResult.ok) {
-              const detail =
-                citationResult.totalCitations === 0
-                  ? "0 citations found"
-                  : citationResult.invalidCitations.map((c) => `${c.raw} (${c.reason})`).join("; ");
-              rejectionReason = `Citation gate failed: ${detail}`;
+              rejectionReason = formatCitationGateFailure(citationResult);
               lastDiagnostic = rejectionReason;
             } else {
               rejectionReason = `PoC Gate failed (exit ${gateResult?.exitCode ?? 1})`;
@@ -2200,6 +2271,7 @@ export async function runBurnPlaybook(input: {
         cwd: inspectRepoRoot,
         timeoutMs,
         openCodeRunner: input.openCodeRunner,
+        framing: run.framing,
         attempts: run.attempts,
         councilNotes: run.councilNotes,
       });
@@ -2212,7 +2284,7 @@ export async function runBurnPlaybook(input: {
         run.winningModel = winners[0].model;
       }
       const winningCodeAttempt = winners.find((a) => a.branchName);
-      if (winningCodeAttempt?.branchName) {
+      if (winningCodeAttempt?.branchName && inspectRepoRoot === project.root) {
         run.winningBranch = winningCodeAttempt.branchName;
         if (winningCodeAttempt.claimedCommit) {
           run.winningCommit = winningCodeAttempt.claimedCommit;
@@ -2295,6 +2367,7 @@ export async function runBurnPlaybook(input: {
         cwd: arenaProjectRoot,
         timeoutMs,
         openCodeRunner: input.openCodeRunner,
+        framing: run.framing,
         attempts: run.attempts,
         councilNotes: run.councilNotes,
       });

@@ -7,10 +7,10 @@
  */
 export { createFactory } from "./factory.ts";
 export type { Factory, FactoryOptions, ContractInput, ClaimInput, ClaimOutcome, AcceptInput, SpawnInput, SpawnDecision, RespawnInput, RespawnDecision, MeterInput } from "./factory.ts";
-export { resolveProject, projectStateDir } from "./project.ts";
-export type { ProjectResolution } from "./project.ts";
-export { resolveClaimedCommit, checkCleanAt, diffBetween, changedFiles, scopeCoversFile } from "./workspace.ts";
-export type { CommitResolution, TreeCheck } from "./workspace.ts";
+export { resolveProject, projectStateDir, readProjectRegistration, writeProjectRegistration, listProjectRegistrations, discoverProjects } from "./project.ts";
+export type { ProjectResolution, ProjectRegistration } from "./project.ts";
+export { resolveClaimedCommit, checkCleanAt, diffBetween, changedFiles, scopeCoversFile, headCommitSync, changesOutsideScope, landTaskWorktree, taskWorktreePath, parseTaskWorktreePath, taskWorktreeBranch, prepareTaskWorktree } from "./workspace.ts";
+export type { CommitResolution, TreeCheck, LandingResult, PrepareTaskWorktreeOptions, PrepareTaskWorktreeResult } from "./workspace.ts";
 export { Ledger, usageIsValid } from "./ledger.ts";
 export { runGate } from "./gate.ts";
 export type { GateInput, GateResult } from "./gate.ts";
@@ -66,6 +66,8 @@ export {
   saveLanes,
 } from "./lanes.ts";
 export type { LaneCliInvocation, LaneCliRunner, LaneName, Lanes, LanesResult, ParsedLane } from "./lanes.ts";
+export { provisionPiAgentHome } from "./pi-home.ts";
+export type { PiAgentRole, ProvisionPiHomeOptions } from "./pi-home.ts";
 export {
   judgeShellCommand,
   judgeFilePath,
@@ -115,22 +117,3 @@ export type {
   RetroWritten,
 } from "./events.ts";
 export { EVENT_NAMES, MAX_ATTEMPTS } from "./events.ts";
-export { headCommitSync, changesOutsideScope, landTaskWorktree } from "./workspace.ts";
-export type { LandingResult } from "./workspace.ts";
-export { provisionPiAgentHome } from "./pi-home.ts";
-export type { PiAgentRole, PiAgentHomeInput } from "./pi-home.ts";
-export {
-  readProjectRegistration,
-  writeProjectRegistration,
-  listProjectRegistrations,
-  discoverProjects,
-  taskWorktreePath,
-  parseTaskWorktreePath,
-  taskWorktreeBranch,
-  prepareTaskWorktree,
-} from "./companion-bridge.ts";
-export type {
-  ProjectRegistration,
-  PrepareTaskWorktreeOptions,
-  PrepareTaskWorktreeResult,
-} from "./companion-bridge.ts";

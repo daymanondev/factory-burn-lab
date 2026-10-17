@@ -4,7 +4,7 @@
 
 **Blocked by:** 01: Vendored `paseo-factory` core sync, unified `Project` registry, and `runLaneCli` `Supervisor` runner
 
-**Status:** done
+Status: done
 
 - [x] Code `Burn run`s instantiate `createFactory({ stateDir: "<paseoHome>/burn-lab/runs/<runId>/factory", projectSlug })`, leaving `<paseoHome>/plugin-state/paseo-factory/` and `<paseoHome>/factory/ledger.jsonl` with zero writes.
 - [x] When no `Gate` override is provided, `factory-burn-lab` infers `"npm test"` when `<projectRoot>/package.json` defines a real `test` script (`"npm test && npm run check:bundle"` for `self-evolve`), falling back to `"node -e \"process.exit(0)\""` only when no test script exists.

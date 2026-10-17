@@ -46,83 +46,14 @@ function findUpstreamFactorySrcDir() {
   return null;
 }
 
-const BRIDGE_SYMBOLS = new Set([
-  "ProjectRegistration",
-  "readProjectRegistration",
-  "writeProjectRegistration",
-  "listProjectRegistrations",
-  "discoverProjects",
-  "taskWorktreePath",
-  "parseTaskWorktreePath",
-  "taskWorktreeBranch",
-  "prepareTaskWorktree",
-  "PrepareTaskWorktreeOptions",
-  "PrepareTaskWorktreeResult",
-]);
-
-function stripBridgeSymbolsFromIndex(rawIndex) {
-  return rawIndex.replace(
-    /export\s+(type\s+)?\{([^}]+)\}\s+from\s+"(\.\/(?:project|workspace)\.ts)";/g,
-    (fullMatch, typeKeyword, specifiers, fromPath) => {
-      const kept = specifiers
-        .split(",")
-        .map((s) => s.trim())
-        .filter((s) => s.length > 0 && !BRIDGE_SYMBOLS.has(s.replace(/^type\s+/, "").trim()));
-      if (kept.length === 0) return "";
-      return `export ${typeKeyword ?? ""}{ ${kept.join(", ")} } from "${fromPath}";`;
-    },
-  );
-}
-
 function buildVendoredFactoryCoreIndex(upstreamIndexContent) {
-  let content = stripBridgeSymbolsFromIndex(upstreamIndexContent).trimEnd() + "\n";
-
-  const extraWorkspaceValues = ["headCommitSync", "changesOutsideScope", "landTaskWorktree"].filter(
-    (sym) => !new RegExp(`\\b${sym}\\b`).test(content),
-  );
-  if (extraWorkspaceValues.length > 0) {
-    content += `export { ${extraWorkspaceValues.join(", ")} } from "./workspace.ts";\n`;
-  }
-  if (!/\bLandingResult\b/.test(content)) {
-    content += `export type { LandingResult } from "./workspace.ts";\n`;
-  }
-
-  const extraLanesValues = ["parseLane", "projectLanesPath"].filter(
-    (sym) => !new RegExp(`\\b${sym}\\b`).test(content),
-  );
-  if (extraLanesValues.length > 0) {
-    content += `export { ${extraLanesValues.join(", ")} } from "./lanes.ts";\n`;
-  }
-  if (!/\bParsedLane\b/.test(content)) {
-    content += `export type { ParsedLane } from "./lanes.ts";\n`;
-  }
-
+  let content = `${upstreamIndexContent.trimEnd()}\n`;
   if (!/\bprovisionPiAgentHome\b/.test(content)) {
     content += `export { provisionPiAgentHome } from "./pi-home.ts";\n`;
   }
   if (!/\bPiAgentRole\b/.test(content)) {
     content += `export type { PiAgentRole, PiAgentHomeInput } from "./pi-home.ts";\n`;
   }
-
-  content += [
-    `export {`,
-    `  readProjectRegistration,`,
-    `  writeProjectRegistration,`,
-    `  listProjectRegistrations,`,
-    `  discoverProjects,`,
-    `  taskWorktreePath,`,
-    `  parseTaskWorktreePath,`,
-    `  taskWorktreeBranch,`,
-    `  prepareTaskWorktree,`,
-    `} from "./companion-bridge.ts";`,
-    `export type {`,
-    `  ProjectRegistration,`,
-    `  PrepareTaskWorktreeOptions,`,
-    `  PrepareTaskWorktreeResult,`,
-    `} from "./companion-bridge.ts";`,
-    "",
-  ].join("\n");
-
   return content;
 }
 
@@ -147,6 +78,11 @@ if (!check) {
       const targetIndex = join(factoryCoreDir, "index.ts");
       if (!existsSync(targetIndex) || readFileSync(targetIndex, "utf8") !== generatedIndex) {
         writeFileSync(targetIndex, generatedIndex, "utf8");
+      }
+    }
+    for (const existing of readdirSync(factoryCoreDir)) {
+      if (existing.endsWith(".ts") && !upstreamFiles.includes(existing)) {
+        rmSync(join(factoryCoreDir, existing), { force: true });
       }
     }
   }

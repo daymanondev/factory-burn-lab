@@ -85,8 +85,8 @@ test("burn.snapshot and burn.project.add expose projects, Supervisor lane, Free 
     );
     const reg = readProjectRegistration(factoryStateDir, added.project.slug);
     assert.ok(reg);
+    assert.equal(reg.slug, added.project.slug);
     assert.equal(reg.root, added.project.root);
-    assert.equal(reg.name, "Pet App");
     assert.equal(
       listProjectRegistrations(factoryStateDir).some((r) => r.slug === added.project.slug),
       true,

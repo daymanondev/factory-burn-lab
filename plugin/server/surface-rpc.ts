@@ -674,7 +674,6 @@ export function createBurnSurfaceHandlers(deps: BurnSurfaceDeps = {}) {
 
       writeProjectRegistration(resolveFactoryStateDir(paseoHome), project.slug, {
         root: project.root,
-        name: project.name,
         supervisor: agentId,
       });
 

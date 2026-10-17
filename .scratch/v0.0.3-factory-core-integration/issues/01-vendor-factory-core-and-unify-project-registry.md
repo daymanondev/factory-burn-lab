@@ -4,7 +4,7 @@
 
 **Blocked by:** None (can start immediately)
 
-**Status:** done
+Status: done
 
 - [x] `scripts/sync-plugin-core.mjs` vendors `paseo-factory`'s pure-Node modules into `src/factory-core/` (exporting `createFactory`, `runGate`, `loadLanes`, `runLaneCli`, `parseLane`, `projectLanesPath`, `provisionPiAgentHome`, `resolveProject`, `projectStateDir`, `readProjectRegistration`, `writeProjectRegistration`, `listProjectRegistrations`, `discoverProjects`, `resolveClaimedCommit`, `checkCleanAt`, `headCommitSync`, `diffBetween`, `changedFiles`, `changesOutsideScope`, `scopeCoversFile`, `prepareTaskWorktree`, `landTaskWorktree`, `MEMORY_FILES`, `WATCH_QUESTIONS`, `parseEyeAnswer`, `MAX_ATTEMPTS`) and mirrors `src/` (including `src/factory-core/`) into `plugin/server/core/`.
 - [x] `npm run sync:plugin-core:check` verifies 100% identity between `src/` and `plugin/server/core/` (including `factory-core/`).

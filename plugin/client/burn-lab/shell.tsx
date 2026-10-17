@@ -275,6 +275,26 @@ export function BurnLabShell({
         projectRoot: selectedSlug === undefined ? dir : undefined,
       });
       if (!r.ok) return { ok: false as const, code: r.code, error: r.error };
+      if (detailModal !== null && !detailModal.loading) {
+        const latestSummary = r.view.runs.find((run) => run.id === detailModal.runId);
+        if (
+          latestSummary &&
+          (detailModal.detail === null ||
+            detailModal.detail.run.status !== latestSummary.status ||
+            detailModal.detail.run.updatedAt !== latestSummary.updatedAt ||
+            detailModal.detail.run.attemptCount !== latestSummary.attemptCount)
+        ) {
+          const detailRes = await detailCall({ runId: detailModal.runId });
+          if (detailRes.ok) {
+            setDetailModal({
+              runId: detailModal.runId,
+              loading: false,
+              detail: detailRes.detail,
+              error: null,
+            });
+          }
+        }
+      }
       return { ok: true as const, value: r.view };
     },
     `burn-lab:${selectedSlug ?? dir ?? "default"}:${bump}`,
@@ -384,10 +404,10 @@ export function BurnLabShell({
         awaitCompletion: false,
       });
       if (res.ok) {
+        setRunFilter("all");
         setStatusNote(
-          `Burn run ${res.run.id} (${res.run.playbook}) → ${res.run.status} (${res.run.acceptedCount}/${res.run.attemptCount} verified)`,
+          `Burn run ${res.run.id} (${res.run.playbook}) → ${res.run.status} (streaming live phases…)`,
         );
-        openRunDetail(res.run.id);
       }
       return res;
     });

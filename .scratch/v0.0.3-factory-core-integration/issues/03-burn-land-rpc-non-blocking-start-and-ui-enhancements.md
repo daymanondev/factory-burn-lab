@@ -4,7 +4,7 @@
 
 **Blocked by:** 02: Run-scoped `createFactory`, self-repair rework loop, diff-backed `Council`, and `OSS lab` Smart Repo Indexer
 
-**Status:** done
+Status: done
 
 - [x] `plugin/shared/rpc.ts` and `plugin/shared/view.ts` define `burnLand` (`name: "burn.land"`) and expose `winningBranch`, `winningCommit`, `landingStatus`, `landingNote`, `reworkAttempts` (`attemptCount`), `factoryVerdict`, `changedFiles`, and `diffPatch` across run summary and detail schemas.
 - [x] `handlers.start` pre-allocates `runId` and writes the initial `"queued"` `BurnRunRecord` synchronously before launching the async execution loop, so `handlers.start({ ..., awaitCompletion: false })` immediately returns the newly queued run summary (never a stale previous run).

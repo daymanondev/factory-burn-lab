@@ -187,8 +187,8 @@ test("resolveBurnProjects, resolveSupervisorLane, addBurnProject, and defaultSup
     assert.equal(existsSync(sharedProjectJson), true);
     const reg = factoryCore.readProjectRegistration(factoryStateDir, added.project.slug);
     assert.ok(reg);
+    assert.equal(reg.slug, added.project.slug);
     assert.equal(reg.root, added.project.root);
-    assert.equal(reg.name, "Pet Prototype");
     assert.equal(
       factoryCore.listProjectRegistrations(factoryStateDir).some((r) => r.slug === added.project.slug),
       true,
@@ -1177,6 +1177,8 @@ test("runCouncilCrossCheck feeds actual git diff, Gate output, and all 5 WATCH_Q
                 goal: "Verify diff-backed Council catches test-weakened",
                 subtasks: ["Fix computeScore"],
                 gateCommand: 'node -e "console.log(\'GATE_STDOUT_MARKER_123\')"',
+                artifact: "README.md",
+                scope: ["src/"],
               })
             : "# Council Rejected Report",
       }),
@@ -1186,14 +1188,14 @@ test("runCouncilCrossCheck feeds actual git diff, Gate output, and all 5 WATCH_Q
           if (prompt.includes("WEAKENED_ASSERTION_DELETED")) {
             return {
               ok: true,
-              stdout: "VERDICT: CHALLENGE — Flagged test-weakened: worker deleted test assertion in diff.",
+              stdout: "VERDICT: CHALLENGE — Flagged test-weakened: Free model deleted test assertion in diff.",
               stderr: "",
               latencyMs: 90,
             };
           }
           return { ok: true, stdout: "VERDICT: APPROVE — Looks good.", stderr: "", latencyMs: 90 };
         }
-        // Worker claims everything is great in stdout, but weakens test in git diff!
+        // Free model claims everything is great in stdout, but weakens test in git diff!
         writeFileSync(
           join(cwd, "src", "app.ts"),
           "// WEAKENED_ASSERTION_DELETED\nexport function computeScore(): number { return 0; }\n",
@@ -1211,7 +1213,10 @@ test("runCouncilCrossCheck feeds actual git diff, Gate output, and all 5 WATCH_Q
     assert.equal(run.status, "completed");
     assert.equal(councilPrompts.length >= 2, true);
     for (const cp of councilPrompts) {
-      // Must include actual git diff and gate output
+      // Must include Contract (artifact + scope), ATTEMPT_OUTPUT, actual git diff, and gate output
+      assert.match(cp, /CONTRACT: artifact=README\.md, scope=src\//);
+      assert.match(cp, /ATTEMPT_OUTPUT:/);
+      assert.equal(cp.includes("WORKER_OUTPUT:"), false);
       assert.match(cp, /WEAKENED_ASSERTION_DELETED/);
       assert.match(cp, /GATE_STDOUT_MARKER_123/);
       // Must include all 5 WATCH_QUESTIONS names
@@ -1235,9 +1240,11 @@ test("runCouncilCrossCheck feeds actual git diff, Gate output, and all 5 WATCH_Q
 test("buildSmartRepoExcerpts and oss-lab index nested files beyond 20 lines via git ls-files and validate deep citations", async () => {
   const paseoHome = mkdtempSync(join(tmpdir(), "burn-smart-oss-home-"));
   const repoDir = mkdtempSync(join(tmpdir(), "burn-smart-oss-repo-"));
+  const externalRepoDir = mkdtempSync(join(tmpdir(), "burn-external-oss-repo-"));
 
   try {
     initTempGitRepo(repoDir);
+    initTempGitRepo(externalRepoDir);
     // Create 6 nested modules, including a deep 60-line file in src/deep/engine/calculator.ts
     const nestedDirs = [
       "src/mod1",
@@ -1324,7 +1331,7 @@ test("buildSmartRepoExcerpts and oss-lab index nested files beyond 20 lines via 
       ],
     });
 
-    const seenWorkerPrompts: string[] = [];
+    const seenAttemptPrompts: string[] = [];
     const ossRun = await runBurnPlaybook({
       paseoHome,
       projectSlug: added.project.slug,
@@ -1351,7 +1358,7 @@ test("buildSmartRepoExcerpts and oss-lab index nested files beyond 20 lines via 
             latencyMs: 80,
           };
         }
-        seenWorkerPrompts.push(prompt);
+        seenAttemptPrompts.push(prompt);
         return {
           ok: true,
           stdout: "hyperQuantumScorer multiplies by 42 at [src/deep/engine/calculator.ts:38-42].",
@@ -1362,11 +1369,47 @@ test("buildSmartRepoExcerpts and oss-lab index nested files beyond 20 lines via 
     });
 
     assert.equal(ossRun.status, "completed");
-    assert.equal(seenWorkerPrompts.some((p) => p.includes("40: export function hyperQuantumScorer")), true);
+    assert.equal(seenAttemptPrompts.some((p) => p.includes("40: export function hyperQuantumScorer")), true);
     assert.equal(ossRun.attempts.some((a) => a.accepted), true);
+    assert.ok(ossRun.winningBranch);
+
+    // When targetRepo is an external repo different from project.root, winningBranch must not be set on the project
+    const externalOssRun = await runBurnPlaybook({
+      paseoHome,
+      projectSlug: added.project.slug,
+      playbook: "oss-lab",
+      prompt: "Inspect external repo src/app.ts",
+      targetRepo: externalRepoDir,
+      supervisorRunner: async ({ phase }) => ({
+        ok: true,
+        stdout:
+          phase === "framing"
+            ? JSON.stringify({
+                goal: "Audit external repo",
+                subtasks: ["Cite src/app.ts"],
+                citationRequired: true,
+              })
+            : "# External OSS Report",
+      }),
+      openCodeRunner: async ({ prompt }) => {
+        if (prompt.includes("COUNCIL_REVIEW")) {
+          return { ok: true, stdout: "VERDICT: APPROVE — Valid.", stderr: "", latencyMs: 60 };
+        }
+        return {
+          ok: true,
+          stdout: "External repo score logic at [src/app.ts:1-3].",
+          stderr: "",
+          latencyMs: 100,
+        };
+      },
+    });
+    assert.equal(externalOssRun.status, "completed");
+    assert.equal(externalOssRun.winningBranch, undefined);
+    assert.equal(externalOssRun.landingStatus, undefined);
   } finally {
     rmSync(paseoHome, { recursive: true, force: true });
     rmSync(repoDir, { recursive: true, force: true });
+    rmSync(externalRepoDir, { recursive: true, force: true });
   }
 });
 
