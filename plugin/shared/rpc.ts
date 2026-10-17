@@ -158,3 +158,22 @@ export const burnPreflight = defineRpc({
     Failure,
   ]),
 });
+
+export const burnLand = defineRpc({
+  name: "burn.land",
+  input: z.object({
+    runId: z.string().min(1),
+  }),
+  output: z.union([
+    z.object({
+      ok: z.literal(true),
+      runId: z.string(),
+      landing: z.enum(["landed", "pending-conflict"]),
+      winningBranch: z.string(),
+      winningCommit: z.string(),
+      summary: z.string(),
+    }),
+    Failure,
+  ]),
+});
+

@@ -53,16 +53,19 @@ export {
   DEFAULT_LANE,
   EYE_JSON_LANE,
   LANE_NAMES,
+  TOOLLESS_OPENCODE_CONFIG,
   defaultLanes,
   laneCliAvailable,
   laneCliInvocation,
   laneError,
   lanesPath,
   loadLanes,
+  parseLane,
+  projectLanesPath,
   runLaneCli,
   saveLanes,
 } from "./lanes.ts";
-export type { LaneCliInvocation, LaneCliRunner, LaneName, Lanes, LanesResult } from "./lanes.ts";
+export type { LaneCliInvocation, LaneCliRunner, LaneName, Lanes, LanesResult, ParsedLane } from "./lanes.ts";
 export {
   judgeShellCommand,
   judgeFilePath,
@@ -114,8 +117,6 @@ export type {
 export { EVENT_NAMES, MAX_ATTEMPTS } from "./events.ts";
 export { headCommitSync, changesOutsideScope, landTaskWorktree } from "./workspace.ts";
 export type { LandingResult } from "./workspace.ts";
-export { parseLane, projectLanesPath } from "./lanes.ts";
-export type { ParsedLane } from "./lanes.ts";
 export { provisionPiAgentHome } from "./pi-home.ts";
 export type { PiAgentRole, PiAgentHomeInput } from "./pi-home.ts";
 export {

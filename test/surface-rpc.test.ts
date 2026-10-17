@@ -456,5 +456,203 @@ test("createBurnSurfaceHandlers defaults to trial home ~/.paseo-factory when pre
   assert.equal(existsSync(join(trialHome, "factory", "ledger.jsonl")), false);
 });
 
+test("burn.start (awaitCompletion: false), burn.detail, and burn.land pre-allocate queued runs, surface rework/diff fields, and land winning branches via landTaskWorktree", async () => {
+  const paseoHome = mkdtempSync(join(tmpdir(), "burn-surface-land-home-"));
+  const repoDir = mkdtempSync(join(tmpdir(), "burn-surface-land-repo-"));
+  const upstreamDir = mkdtempSync(join(tmpdir(), "burn-surface-land-upstream-"));
+
+  try {
+    initTempGitRepo(repoDir);
+    saveFreePool(paseoHome, {
+      updatedAt: new Date().toISOString(),
+      models: [
+        {
+          id: "opencode/glm-5.3-flash-free",
+          family: "glm",
+          displayName: "GLM 5.3 Flash Free",
+          contextWindow: 204_800,
+          healthy: true,
+          latencyMs: 150,
+          gatePassed: true,
+          citationPassed: true,
+          roles: ["coder", "reviewer"],
+          wins: 2,
+          attempts: 2,
+          lastScoutedAt: new Date().toISOString(),
+        },
+        {
+          id: "opencode/deepseek-v4.1-flash-free",
+          family: "deepseek",
+          displayName: "DeepSeek V4.1 Flash Free",
+          contextWindow: 200_000,
+          healthy: true,
+          latencyMs: 210,
+          gatePassed: true,
+          citationPassed: true,
+          roles: ["coder", "reviewer"],
+          wins: 1,
+          attempts: 2,
+          lastScoutedAt: new Date().toISOString(),
+        },
+      ],
+    });
+
+    let slowRunDelayMs = 0;
+    const handlers = createBurnSurfaceHandlers({
+      paseoHome,
+      upstreamIssuesDir: upstreamDir,
+      includeSelfRepo: false,
+      supervisorRunner: async ({ phase }) => {
+        if (slowRunDelayMs > 0) {
+          await new Promise((r) => setTimeout(r, slowRunDelayMs));
+        }
+        return {
+          ok: true,
+          stdout:
+            phase === "framing"
+              ? JSON.stringify({
+                  goal: "Build src/feature.ts and verify under Gate",
+                  subtasks: ["Create src/feature.ts exporting FEATURE_LANDED = true"],
+                  gateCommand: 'node -e "process.exit(0)"',
+                  artifact: "README.md",
+                  scope: ["src"],
+                  citationRequired: false,
+                })
+              : "# Proto Arena Synthesis\n\nWinning branch ready to land.",
+        };
+      },
+      openCodeRunner: async ({ model, prompt, cwd }) => {
+        if (prompt.includes("COUNCIL_REVIEW")) {
+          return {
+            ok: true,
+            stdout: "VERDICT: APPROVE — Clean diff inside src/feature.ts.",
+            stderr: "",
+            latencyMs: 80,
+          };
+        }
+        if (model.includes("glm")) {
+          mkdirSync(join(cwd, "src"), { recursive: true });
+          writeFileSync(
+            join(cwd, "src", "feature.ts"),
+            "export const FEATURE_LANDED = true;\n",
+            "utf8",
+          );
+        }
+        return {
+          ok: true,
+          stdout: `Implemented src/feature.ts from ${model}`,
+          stderr: "",
+          latencyMs: model.includes("glm") ? 110 : 220,
+        };
+      },
+    });
+
+    const added = await handlers.projectAdd({ repoPath: repoDir, name: "Landing Repo" });
+    assert.equal(added.ok, true);
+    if (!added.ok) return;
+
+    // Seed an earlier completed run so burn-lab/runs/ is non-empty
+    const priorStart = await handlers.start({
+      playbook: "proto-arena",
+      prompt: "Seed prior completed run",
+      projectSlug: added.project.slug,
+      awaitCompletion: true,
+    });
+    assert.equal(priorStart.ok, true);
+    if (!priorStart.ok) return;
+    assert.equal(priorStart.run.status, "completed");
+
+    // (a) Non-blocking start (awaitCompletion: false) synchronously pre-allocates a fresh queued run
+    slowRunDelayMs = 60;
+    const asyncStart = await handlers.start({
+      playbook: "proto-arena",
+      prompt: "Create src/feature.ts in isolated worktree for landing",
+      projectSlug: added.project.slug,
+      awaitCompletion: false,
+    });
+    assert.equal(asyncStart.ok, true);
+    if (!asyncStart.ok) return;
+    assert.notEqual(asyncStart.run.id, priorStart.run.id);
+    assert.equal(asyncStart.run.status, "queued");
+
+    // Wait for background completion
+    let detailRes = await handlers.detail({ runId: asyncStart.run.id });
+    for (let i = 0; i < 100; i++) {
+      detailRes = await handlers.detail({ runId: asyncStart.run.id });
+      if (detailRes.ok && detailRes.detail.run.status === "completed") {
+        break;
+      }
+      await new Promise((r) => setTimeout(r, 25));
+    }
+
+    // (b) Detail exposes winningBranch, winningCommit, landingStatus, attemptCount, factoryVerdict, changedFiles, diffPatch
+    assert.equal(detailRes.ok, true);
+    if (!detailRes.ok) return;
+    const detail = detailRes.detail;
+    assert.equal(detail.run.status, "completed");
+    assert.equal(detail.run.winningBranch, `burn/${asyncStart.run.id}/glm-5.3-flash-free`);
+    assert.match(detail.run.winningCommit ?? "", /^[0-9a-f]{40}$/i);
+    assert.equal(detail.run.landingStatus, "not_landed");
+    assert.equal(detail.framing?.artifact, "README.md");
+    assert.deepEqual(detail.framing?.scope, ["src"]);
+
+    const winningAttempt = detail.attempts.find(
+      (a) => a.model === "opencode/glm-5.3-flash-free",
+    );
+    assert.ok(winningAttempt);
+    assert.equal(winningAttempt.attemptCount, 1);
+    assert.equal(winningAttempt.factoryVerdict, "green");
+    assert.equal(winningAttempt.changedFiles.includes("src/feature.ts"), true);
+    assert.match(winningAttempt.diffPatch ?? "", /FEATURE_LANDED/);
+
+    // (c.1) Dirty <project-root> -> handlers.land returns pending-conflict and preserves winningBranch
+    writeFileSync(join(repoDir, "README.md"), "# Uncommitted dirty edit\n", "utf8");
+    const conflictRes = await handlers.land({ runId: asyncStart.run.id });
+    assert.equal(conflictRes.ok, true);
+    if (!conflictRes.ok) return;
+    assert.equal(conflictRes.landing, "pending-conflict");
+    assert.equal(conflictRes.winningBranch, detail.run.winningBranch);
+    assert.equal(conflictRes.winningCommit, detail.run.winningCommit);
+    assert.match(conflictRes.summary, /not clean|pending-conflict/i);
+    assert.equal(existsSync(join(repoDir, "src", "feature.ts")), false);
+
+    const branchStillExists = execFileSync(
+      "git",
+      ["branch", "--list", detail.run.winningBranch!],
+      { cwd: repoDir, encoding: "utf8" },
+    );
+    assert.equal(branchStillExists.includes(detail.run.winningBranch!), true);
+
+    const afterConflictDetail = await handlers.detail({ runId: asyncStart.run.id });
+    assert.equal(afterConflictDetail.ok, true);
+    if (afterConflictDetail.ok) {
+      assert.equal(afterConflictDetail.detail.run.landingStatus, "pending-conflict");
+      assert.ok(afterConflictDetail.detail.run.landingNote);
+    }
+
+    // (c.2) Clean <project-root> -> handlers.land merges winningCommit cleanly and sets landingStatus: "landed"
+    execFileSync("git", ["checkout", "--", "README.md"], { cwd: repoDir, stdio: "ignore" });
+    const landedRes = await handlers.land({ runId: asyncStart.run.id });
+    assert.equal(landedRes.ok, true);
+    if (!landedRes.ok) return;
+    assert.equal(landedRes.landing, "landed");
+    assert.equal(landedRes.winningBranch, detail.run.winningBranch);
+    assert.equal(landedRes.winningCommit, detail.run.winningCommit);
+    assert.equal(existsSync(join(repoDir, "src", "feature.ts")), true);
+    assert.match(readFileSync(join(repoDir, "src", "feature.ts"), "utf8"), /FEATURE_LANDED/);
+
+    const afterLandDetail = await handlers.detail({ runId: asyncStart.run.id });
+    assert.equal(afterLandDetail.ok, true);
+    if (afterLandDetail.ok) {
+      assert.equal(afterLandDetail.detail.run.landingStatus, "landed");
+    }
+  } finally {
+    rmSync(paseoHome, { recursive: true, force: true });
+    rmSync(repoDir, { recursive: true, force: true });
+    rmSync(upstreamDir, { recursive: true, force: true });
+  }
+});
+
+
 
 

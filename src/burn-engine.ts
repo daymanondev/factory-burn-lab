@@ -24,6 +24,7 @@ import {
   headCommitSync,
   type LaneCliRunner,
   lanesPath,
+  landTaskWorktree,
   listProjectRegistrations,
   loadLanes,
   MAX_ATTEMPTS,
@@ -33,6 +34,7 @@ import {
   projectLanesPath,
   projectStateDir,
   readProjectRegistration,
+  resolveClaimedCommit,
   resolveProject,
   runLaneCli,
   tailWithMarker,
@@ -1705,10 +1707,150 @@ function updateFreePoolStatsFromAttempts(paseoHome: string, attempts: BurnAttemp
   }
 }
 
+export function allocateBurnRunRecord(input: {
+  paseoHome: string;
+  playbook: BurnPlaybook;
+  prompt: string;
+  projectSlug?: string;
+  targetRepo?: string;
+  gateCommand?: string;
+  runId?: string;
+}): BurnRunRecord {
+  const projects = resolveBurnProjects(input.paseoHome);
+  const project: BurnProject =
+    (input.projectSlug ? projects.find((p) => p.slug === input.projectSlug) : undefined) ??
+    projects[0] ?? {
+      slug: "factory-burn-lab-default",
+      name: "factory-burn-lab",
+      root: DEFAULT_SELF_REPO_ROOT,
+      supervisorLane: resolveSupervisorLane(input.paseoHome, input.projectSlug),
+      source: "burn-lab",
+    };
+
+  const runId =
+    input.runId ?? `burn-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+  const now = new Date().toISOString();
+  const artifactDir = burnRunArtifactDir(input.paseoHome, runId);
+  mkdirSync(artifactDir, { recursive: true });
+
+  const run: BurnRunRecord = {
+    id: runId,
+    playbook: input.playbook,
+    projectSlug: project.slug,
+    projectRoot: project.root,
+    supervisorLane: project.supervisorLane,
+    prompt: input.prompt,
+    targetRepo: input.targetRepo,
+    gateCommand: input.gateCommand,
+    status: "queued",
+    statusHistory: ["queued"],
+    createdAt: now,
+    updatedAt: now,
+    attempts: [],
+    councilNotes: [],
+  };
+
+  saveBurnRun(input.paseoHome, run);
+  return run;
+}
+
+export async function landBurnRunWinningBranch(
+  paseoHome: string,
+  runId: string,
+): Promise<
+  | {
+      ok: true;
+      runId: string;
+      landing: "landed" | "pending-conflict";
+      winningBranch: string;
+      winningCommit: string;
+      summary: string;
+    }
+  | { ok: false; code: string; error: string }
+> {
+  const run = loadBurnRun(paseoHome, runId);
+  if (!run) {
+    return {
+      ok: false,
+      code: "unknown-run",
+      error: `no Burn run found with id ${runId}`,
+    };
+  }
+
+  const winningAttempt =
+    run.attempts.find(
+      (a) =>
+        (run.winningAttemptId && a.id === run.winningAttemptId) ||
+        (run.winningBranch && a.branchName === run.winningBranch),
+    ) ?? run.attempts.find((a) => a.accepted && a.branchName);
+
+  const winningBranch = run.winningBranch ?? winningAttempt?.branchName;
+  if (!winningBranch) {
+    return {
+      ok: false,
+      code: "no-winning-branch",
+      error: `Burn run ${runId} has no verified winning branch to land`,
+    };
+  }
+
+  let winningCommit = run.winningCommit ?? winningAttempt?.claimedCommit;
+  if (!winningCommit) {
+    const resolved = await resolveClaimedCommit(run.projectRoot, winningBranch);
+    if (resolved.ok) {
+      winningCommit = resolved.full;
+    }
+  }
+  if (!winningCommit) {
+    return {
+      ok: false,
+      code: "no-winning-commit",
+      error: `Burn run ${runId} has no verified winning commit for branch ${winningBranch}`,
+    };
+  }
+
+  const worktree =
+    winningAttempt?.worktreeDir ??
+    join(burnRunArtifactDir(paseoHome, run.id), "worktrees", winningAttempt?.id ?? "attempt-1");
+  const base = winningAttempt?.baseCommit;
+
+  const result = await landTaskWorktree({
+    projectRoot: run.projectRoot,
+    worktree,
+    claimedCommit: winningCommit,
+    ...(base ? { base } : {}),
+    branch: winningBranch,
+  });
+
+  const shortCommit = winningCommit.slice(0, 7);
+  const summary =
+    result.landing === "landed"
+      ? result.note
+        ? `Accepted and landed ${winningBranch} (${shortCommit}) into ${run.projectRoot} (${result.note}).`
+        : `Accepted and landed ${winningBranch} (${shortCommit}) into ${run.projectRoot}.`
+      : `Pending conflict landing ${winningBranch} (${shortCommit}): ${result.note}`;
+
+  run.winningBranch = winningBranch;
+  run.winningCommit = winningCommit;
+  run.landingStatus = result.landing;
+  run.landingNote = result.note ?? summary;
+  run.updatedAt = new Date().toISOString();
+  saveBurnRun(paseoHome, run);
+
+  return {
+    ok: true,
+    runId: run.id,
+    landing: result.landing,
+    winningBranch,
+    winningCommit,
+    summary,
+  };
+}
+
 export async function runBurnPlaybook(input: {
   paseoHome: string;
   playbook: BurnPlaybook;
   prompt: string;
+  runId?: string;
   projectSlug?: string;
   targetRepo?: string;
   gateCommand?: string;
@@ -1743,27 +1885,21 @@ export async function runBurnPlaybook(input: {
       source: "burn-lab",
     };
 
-  const runId = `burn-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
-  const now = new Date().toISOString();
+  const preAllocated = input.runId ? loadBurnRun(input.paseoHome, input.runId) : null;
+  const run: BurnRunRecord =
+    preAllocated ??
+    allocateBurnRunRecord({
+      paseoHome: input.paseoHome,
+      playbook: input.playbook,
+      prompt: input.prompt,
+      projectSlug: input.projectSlug,
+      targetRepo: input.targetRepo,
+      gateCommand: input.gateCommand,
+      runId: input.runId,
+    });
+  const runId = run.id;
   const artifactDir = burnRunArtifactDir(input.paseoHome, runId);
   mkdirSync(artifactDir, { recursive: true });
-
-  const run: BurnRunRecord = {
-    id: runId,
-    playbook: input.playbook,
-    projectSlug: project.slug,
-    projectRoot: project.root,
-    supervisorLane: project.supervisorLane,
-    prompt: input.prompt,
-    targetRepo: input.targetRepo,
-    gateCommand: input.gateCommand,
-    status: "queued",
-    statusHistory: ["queued"],
-    createdAt: now,
-    updatedAt: now,
-    attempts: [],
-    councilNotes: [],
-  };
 
   const transition = (nextStatus: BurnRunStatus) => {
     run.status = nextStatus;
@@ -1775,6 +1911,7 @@ export async function runBurnPlaybook(input: {
   };
 
   saveBurnRun(input.paseoHome, run);
+  await Promise.resolve();
 
   const execSupervisor = input.supervisorRunner ?? defaultSupervisorRunner;
   let worktreeHostRoot = project.root;
