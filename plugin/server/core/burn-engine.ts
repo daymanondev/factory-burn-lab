@@ -95,6 +95,7 @@ export interface BurnAttemptRecord {
   latencyMs: number;
   output: string;
   worktreeDir?: string;
+  branchName?: string;
   gateResult?: GateRunResult;
   citationResult?: CitationGateResult;
   accepted: boolean;
@@ -130,10 +131,30 @@ export interface BurnRunRecord {
   councilNotes: BurnCouncilNote[];
   winningAttemptId?: string;
   winningModel?: string;
+  winningBranch?: string;
   reportPath?: string;
   reportMarkdown?: string;
   upstreamIssue?: UpstreamIssue;
   error?: string;
+}
+
+export interface ParsedSupervisorLane {
+  provider: string;
+  model: string;
+  providerSpec: string;
+  thinking?: string;
+}
+
+export function parseSupervisorLane(lane: string): ParsedSupervisorLane {
+  const trimmed = lane.trim() || DEFAULT_SUPERVISOR_LANE;
+  const slashIdx = trimmed.indexOf("/");
+  const colonIdx = trimmed.lastIndexOf(":");
+  const hasThinking = colonIdx > slashIdx && colonIdx !== -1;
+  const providerSpec = hasThinking ? trimmed.slice(0, colonIdx) : trimmed;
+  const thinking = hasThinking ? trimmed.slice(colonIdx + 1) : undefined;
+  const provider = slashIdx === -1 ? "pi" : providerSpec.slice(0, slashIdx);
+  const model = slashIdx === -1 ? providerSpec : providerSpec.slice(slashIdx + 1);
+  return { provider, model, providerSpec, thinking };
 }
 
 export type SupervisorRunner = (input: {
@@ -391,42 +412,17 @@ export function resolveBurnProjects(
     }
   }
 
-  const burnProjectsFile = burnLabProjectsPath(paseoHome);
-  if (existsSync(burnProjectsFile)) {
-    try {
-      const parsed = JSON.parse(readFileSync(burnProjectsFile, "utf8")) as
-        | { projects?: Record<string, unknown>[] }
-        | Record<string, unknown>[];
-      const list = Array.isArray(parsed)
-        ? parsed
-        : Array.isArray(parsed.projects)
-          ? parsed.projects
-          : [];
-      for (const item of list) {
-        if (item && typeof item === "object") {
-          register(parseProjectEntry(item, paseoHome, "burn-lab"));
-        }
-      }
-    } catch {
-      // ignore
-    }
-  }
+  const projectListSources: Array<{ filePath: string; source: BurnProject["source"] }> = [
+    { filePath: burnLabProjectsPath(paseoHome), source: "burn-lab" },
+    { filePath: join(paseoHome, "projects", "projects.json"), source: "paseo" },
+  ];
 
-  const paseoProjectsFile = join(paseoHome, "projects", "projects.json");
-  if (existsSync(paseoProjectsFile)) {
+  for (const { filePath, source } of projectListSources) {
+    if (!existsSync(filePath)) continue;
     try {
-      const parsed = JSON.parse(readFileSync(paseoProjectsFile, "utf8")) as
-        | { projects?: Record<string, unknown>[] }
-        | Record<string, unknown>[];
-      const list = Array.isArray(parsed)
-        ? parsed
-        : Array.isArray(parsed.projects)
-          ? parsed.projects
-          : [];
-      for (const item of list) {
-        if (item && typeof item === "object") {
-          register(parseProjectEntry(item, paseoHome, "paseo"));
-        }
+      const parsed = JSON.parse(readFileSync(filePath, "utf8")) as unknown;
+      for (const item of unwrapProjectListJson(parsed)) {
+        register(parseProjectEntry(item, paseoHome, source));
       }
     } catch {
       // ignore
@@ -449,60 +445,78 @@ export function resolveBurnProjects(
   return [...bySlug.values()];
 }
 
+function unwrapProjectListJson(parsed: unknown): Record<string, unknown>[] {
+  if (Array.isArray(parsed)) {
+    return parsed.filter(
+      (item): item is Record<string, unknown> => Boolean(item && typeof item === "object"),
+    );
+  }
+  if (
+    parsed &&
+    typeof parsed === "object" &&
+    Array.isArray((parsed as { projects?: unknown }).projects)
+  ) {
+    return (parsed as { projects: unknown[] }).projects.filter(
+      (item): item is Record<string, unknown> => Boolean(item && typeof item === "object"),
+    );
+  }
+  return [];
+}
+
 export function addBurnProject(
   paseoHome: string,
   repoPath: string,
   options?: { initGit?: boolean; name?: string },
 ): { ok: true; project: BurnProject } | { ok: false; error: string } {
-  const targetDir = resolve(repoPath);
+  const projectRoot = resolve(repoPath);
   try {
-    if (!existsSync(targetDir)) {
+    if (!existsSync(projectRoot)) {
       if (!options?.initGit) {
-        return { ok: false, error: `directory does not exist: ${targetDir}` };
+        return { ok: false, error: `directory does not exist: ${projectRoot}` };
       }
-      mkdirSync(targetDir, { recursive: true });
+      mkdirSync(projectRoot, { recursive: true });
     }
 
-    let identity = resolveProjectIdentity(targetDir);
+    let identity = resolveProjectIdentity(projectRoot);
     if (!identity.ok && options?.initGit) {
       execFileSync("git", ["init"], {
-        cwd: targetDir,
+        cwd: projectRoot,
         env: buildExtendedPathEnv(),
         stdio: "ignore",
       });
       execFileSync("git", ["config", "user.email", "burn-lab@local"], {
-        cwd: targetDir,
+        cwd: projectRoot,
         env: buildExtendedPathEnv(),
         stdio: "ignore",
       });
       execFileSync("git", ["config", "user.name", "Factory Burn Lab"], {
-        cwd: targetDir,
+        cwd: projectRoot,
         env: buildExtendedPathEnv(),
         stdio: "ignore",
       });
-      const readmePath = join(targetDir, "README.md");
+      const readmePath = join(projectRoot, "README.md");
       if (!existsSync(readmePath)) {
         writeFileSync(
           readmePath,
-          `# ${options?.name ?? basename(targetDir)}\nInitialized by factory-burn-lab.\n`,
+          `# ${options?.name ?? basename(projectRoot)}\nInitialized by factory-burn-lab.\n`,
           "utf8",
         );
       }
       execFileSync("git", ["add", "."], {
-        cwd: targetDir,
+        cwd: projectRoot,
         env: buildExtendedPathEnv(),
         stdio: "ignore",
       });
       try {
         execFileSync("git", ["commit", "-m", "chore: initialize project repository"], {
-          cwd: targetDir,
+          cwd: projectRoot,
           env: buildExtendedPathEnv(),
           stdio: "ignore",
         });
       } catch {
         // ignore if already committed
       }
-      identity = resolveProjectIdentity(targetDir);
+      identity = resolveProjectIdentity(projectRoot);
     }
 
     if (!identity.ok) {
@@ -523,10 +537,8 @@ export function addBurnProject(
     let existing: BurnProject[] = [];
     if (existsSync(filePath)) {
       try {
-        const parsed = JSON.parse(readFileSync(filePath, "utf8")) as { projects?: BurnProject[] };
-        if (Array.isArray(parsed.projects)) {
-          existing = parsed.projects;
-        }
+        const parsed = JSON.parse(readFileSync(filePath, "utf8")) as unknown;
+        existing = unwrapProjectListJson(parsed) as unknown as BurnProject[];
       } catch {
         existing = [];
       }
@@ -664,9 +676,7 @@ async function defaultSupervisorRunner(input: {
   cwd: string;
   timeoutMs: number;
 }): Promise<{ ok: boolean; stdout: string; stderr?: string; error?: string }> {
-  const slashIdx = input.lane.indexOf("/");
-  const provider = slashIdx === -1 ? "pi" : input.lane.slice(0, slashIdx);
-  const model = slashIdx === -1 ? input.lane : input.lane.slice(slashIdx + 1).split(":")[0];
+  const { provider, model } = parseSupervisorLane(input.lane);
 
   if (provider === "opencode") {
     const res = await runOpenCodeFreeModel({
@@ -675,105 +685,100 @@ async function defaultSupervisorRunner(input: {
       cwd: input.cwd,
       timeoutMs: input.timeoutMs,
     });
-    if (res.ok) return { ok: true, stdout: res.stdout, stderr: res.stderr };
-  } else {
-    const cliResult = await new Promise<{ ok: boolean; stdout: string; stderr: string }>((res) => {
-      let cmd = "pi";
-      let args: string[] = [];
-      if (provider === "pi") {
-        cmd = "pi";
-        args = [
-          "--print",
-          "--no-session",
-          "--no-tools",
-          "--no-extensions",
-          "--no-skills",
-          "--no-context-files",
-          "--model",
-          model,
-        ];
-      } else if (provider === "copilot") {
-        cmd = "copilot";
-        args = ["-s", "--model", model, "--reasoning-effort", "medium"];
-      } else if (provider === "claude") {
-        cmd = "claude";
-        args = ["-p", "--model", model, "--tools", ""];
-      } else {
-        res({ ok: false, stdout: "", stderr: `unsupported provider ${provider}` });
-        return;
-      }
-
-      const child = spawn(cmd, args, {
-        cwd: input.cwd,
-        env: buildExtendedPathEnv(),
-        stdio: ["pipe", "pipe", "pipe"],
-      });
-
-      let stdout = "";
-      let stderr = "";
-      const timer = setTimeout(() => {
-        child.kill("SIGKILL");
-      }, input.timeoutMs);
-
-      child.stdout?.on("data", (d: Buffer) => {
-        stdout += d.toString("utf8");
-      });
-      child.stderr?.on("data", (d: Buffer) => {
-        stderr += d.toString("utf8");
-      });
-      child.on("error", (err) => {
-        clearTimeout(timer);
-        res({ ok: false, stdout, stderr: err.message });
-      });
-      child.on("close", (code) => {
-        clearTimeout(timer);
-        res({
-          ok: code === 0 && stdout.trim().length > 0,
-          stdout: stdout.trim(),
-          stderr: stderr.trim(),
-        });
-      });
-
-      child.stdin?.write(input.prompt);
-      child.stdin?.end();
-    });
-
-    if (cliResult.ok) {
-      return { ok: true, stdout: cliResult.stdout, stderr: cliResult.stderr };
+    if (res.ok) {
+      return { ok: true, stdout: res.stdout, stderr: res.stderr };
     }
-  }
-
-  // Deterministic Supervisor fallback when headless CLI is unreachable
-  if (input.phase === "framing") {
     return {
-      ok: true,
-      stdout: JSON.stringify({
-        goal: `[${input.playbook}] ${input.prompt}`,
-        subtasks: [
-          `Primary ${input.playbook} analysis and implementation for ${input.project.name}`,
-          `Cross-family verification and edge-case audit for ${input.project.name}`,
-        ],
-        gateCommand:
-          input.playbook === "self-evolve"
-            ? "npm test && npm run check:bundle"
-            : "node -e \"process.exit(0)\"",
-        citationRequired: input.playbook === "oss-lab",
-      }),
+      ok: false,
+      stdout: res.stdout,
+      stderr: res.stderr,
+      error: res.error ?? (res.stderr || "opencode supervisor failed"),
     };
   }
 
+  const cliResult = await new Promise<{
+    ok: boolean;
+    stdout: string;
+    stderr: string;
+    error?: string;
+  }>((res) => {
+    let cmd = "pi";
+    let args: string[] = [];
+    if (provider === "pi") {
+      cmd = "pi";
+      args = [
+        "--print",
+        "--no-session",
+        "--no-tools",
+        "--no-extensions",
+        "--no-skills",
+        "--no-context-files",
+        "--model",
+        model,
+      ];
+    } else if (provider === "copilot") {
+      cmd = "copilot";
+      args = ["-s", "--model", model, "--reasoning-effort", "medium"];
+    } else if (provider === "claude") {
+      cmd = "claude";
+      args = ["-p", "--model", model, "--tools", ""];
+    } else {
+      res({
+        ok: false,
+        stdout: "",
+        stderr: `unsupported provider ${provider}`,
+        error: `unsupported provider ${provider}`,
+      });
+      return;
+    }
+
+    const child = spawn(cmd, args, {
+      cwd: input.cwd,
+      env: buildExtendedPathEnv(),
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+
+    let stdout = "";
+    let stderr = "";
+    const timer = setTimeout(() => {
+      child.kill("SIGKILL");
+    }, input.timeoutMs);
+
+    child.stdout?.on("data", (d: Buffer) => {
+      stdout += d.toString("utf8");
+    });
+    child.stderr?.on("data", (d: Buffer) => {
+      stderr += d.toString("utf8");
+    });
+    child.on("error", (err) => {
+      clearTimeout(timer);
+      res({ ok: false, stdout, stderr: err.message, error: err.message });
+    });
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      const cleanStdout = stdout.trim();
+      const cleanStderr = stderr.trim();
+      const ok = code === 0 && cleanStdout.length > 0;
+      res({
+        ok,
+        stdout: cleanStdout,
+        stderr: cleanStderr,
+        error: ok ? undefined : cleanStderr || `${provider} exited with status ${code ?? 1}`,
+      });
+    });
+
+    child.stdin?.write(input.prompt);
+    child.stdin?.end();
+  });
+
+  if (cliResult.ok) {
+    return { ok: true, stdout: cliResult.stdout, stderr: cliResult.stderr };
+  }
   return {
-    ok: true,
-    stdout: [
-      `# Burn Lab Report — ${input.playbook} (${input.project.name})`,
-      "",
-      `- **Supervisor Lane:** \`${input.lane}\``,
-      `- **Project:** \`${input.project.slug}\` (\`${input.project.root}\`)`,
-      "",
-      "## Verified Evidence Summary",
-      "",
-      input.prompt,
-    ].join("\n"),
+    ok: false,
+    stdout: cliResult.stdout,
+    stderr: cliResult.stderr,
+    error: cliResult.error ?? (cliResult.stderr || "supervisor invocation failed"),
   };
 }
 
@@ -824,6 +829,51 @@ function parseFramingOutput(
   };
 }
 
+const DEFAULT_FALLBACK_FREE_MODELS: FreeModelRecord[] = [
+  {
+    id: "opencode/glm-5.3-flash-free",
+    family: "glm",
+    displayName: "GLM 5.3 Flash Free",
+    contextWindow: 204_800,
+    healthy: true,
+    latencyMs: 250,
+    gatePassed: true,
+    citationPassed: true,
+    roles: ["coder", "reader-1m", "reviewer"],
+    wins: 0,
+    attempts: 0,
+    lastScoutedAt: null,
+  },
+  {
+    id: "opencode/deepseek-v4.1-flash-free",
+    family: "deepseek",
+    displayName: "DeepSeek V4.1 Flash Free",
+    contextWindow: 200_000,
+    healthy: true,
+    latencyMs: 300,
+    gatePassed: true,
+    citationPassed: true,
+    roles: ["coder", "reader-1m", "reviewer"],
+    wins: 0,
+    attempts: 0,
+    lastScoutedAt: null,
+  },
+  {
+    id: "opencode/nemotron-3-ultra-free",
+    family: "nemotron",
+    displayName: "Nemotron 3 Ultra Free",
+    contextWindow: 1_000_000,
+    healthy: true,
+    latencyMs: 380,
+    gatePassed: true,
+    citationPassed: true,
+    roles: ["coder", "reader-1m", "reviewer"],
+    wins: 0,
+    attempts: 0,
+    lastScoutedAt: null,
+  },
+];
+
 function selectSwarmModels(
   paseoHome: string,
   preferredRole: SwarmRole,
@@ -833,50 +883,7 @@ function selectSwarmModels(
   let healthy = pool.models.filter((m) => m.healthy);
 
   if (healthy.length === 0) {
-    healthy = [
-      {
-        id: "opencode/glm-5.3-flash-free",
-        family: "glm",
-        displayName: "GLM 5.3 Flash Free",
-        contextWindow: 204_800,
-        healthy: true,
-        latencyMs: 250,
-        gatePassed: true,
-        citationPassed: true,
-        roles: ["coder", "reader-1m", "reviewer"],
-        wins: 0,
-        attempts: 0,
-        lastScoutedAt: null,
-      },
-      {
-        id: "opencode/deepseek-v4.1-flash-free",
-        family: "deepseek",
-        displayName: "DeepSeek V4.1 Flash Free",
-        contextWindow: 200_000,
-        healthy: true,
-        latencyMs: 300,
-        gatePassed: true,
-        citationPassed: true,
-        roles: ["coder", "reader-1m", "reviewer"],
-        wins: 0,
-        attempts: 0,
-        lastScoutedAt: null,
-      },
-      {
-        id: "opencode/nemotron-3-ultra-free",
-        family: "nemotron",
-        displayName: "Nemotron 3 Ultra Free",
-        contextWindow: 1_000_000,
-        healthy: true,
-        latencyMs: 380,
-        gatePassed: true,
-        citationPassed: true,
-        roles: ["coder", "reader-1m", "reviewer"],
-        wins: 0,
-        attempts: 0,
-        lastScoutedAt: null,
-      },
-    ];
+    healthy = DEFAULT_FALLBACK_FREE_MODELS;
   }
 
   const withRole = healthy.filter((m) => m.roles.includes(preferredRole));
@@ -906,51 +913,132 @@ function selectSwarmModels(
   return selected;
 }
 
-function pickCrossFamilyReviewer(
+export function pickCrossFamilyReviewers(
   paseoHome: string,
   targetFamily: string,
   targetModelId: string,
-): FreeModelRecord {
+  maxCount = 2,
+): FreeModelRecord[] {
   const pool = loadFreePool(paseoHome);
   const healthy = pool.models.filter((m) => m.healthy);
-  const crossFamily = healthy.find(
-    (m) => m.family !== targetFamily && (m.roles.includes("reviewer") || m.roles.includes("reader-1m")),
-  );
-  if (crossFamily) return crossFamily;
+  const candidates = healthy
+    .filter((m) => m.family !== targetFamily && m.id !== targetModelId)
+    .sort((a, b) => {
+      const aRev = a.roles.includes("reviewer") || a.roles.includes("reader-1m") ? 1 : 0;
+      const bRev = b.roles.includes("reviewer") || b.roles.includes("reader-1m") ? 1 : 0;
+      if (bRev !== aRev) return bRev - aRev;
+      return (b.wins - a.wins) || ((a.latencyMs ?? 999_999) - (b.latencyMs ?? 999_999));
+    });
 
-  const anyCross = healthy.find((m) => m.family !== targetFamily && m.id !== targetModelId);
-  if (anyCross) return anyCross;
+  const selected: FreeModelRecord[] = [];
+  const usedFamilies = new Set<string>();
 
-  const fallbackId =
-    targetFamily === "nemotron"
-      ? "opencode/glm-5.3-flash-free"
-      : "opencode/nemotron-3-ultra-free";
-  return {
-    id: fallbackId,
-    family: extractModelFamily(fallbackId),
-    displayName: fallbackId,
-    contextWindow: 1_000_000,
-    healthy: true,
-    latencyMs: 300,
-    gatePassed: true,
-    citationPassed: true,
-    roles: ["reviewer", "reader-1m"],
-    wins: 0,
-    attempts: 0,
-    lastScoutedAt: null,
-  };
+  for (const model of candidates) {
+    if (selected.length >= maxCount) break;
+    if (!usedFamilies.has(model.family)) {
+      selected.push(model);
+      usedFamilies.add(model.family);
+    }
+  }
+
+  for (const model of candidates) {
+    if (selected.length >= maxCount) break;
+    if (!selected.some((s) => s.id === model.id)) {
+      selected.push(model);
+    }
+  }
+
+  if (selected.length === 0) {
+    return DEFAULT_FALLBACK_FREE_MODELS.filter(
+      (m) => m.family !== targetFamily && m.id !== targetModelId,
+    ).slice(0, maxCount);
+  }
+
+  return selected;
 }
 
-function prepareIsolatedWorktree(projectRoot: string, destDir: string): string {
+async function runCouncilCrossCheck(input: {
+  paseoHome: string;
+  playbook: BurnPlaybook;
+  cwd: string;
+  timeoutMs: number;
+  openCodeRunner?: OpenCodeRunner;
+  attempts: BurnAttemptRecord[];
+  councilNotes: BurnCouncilNote[];
+}): Promise<void> {
+  for (const attempt of input.attempts.filter((a) => a.accepted)) {
+    const reviewers = pickCrossFamilyReviewers(
+      input.paseoHome,
+      attempt.family,
+      attempt.model,
+      2,
+    );
+    const notesForAttempt = await Promise.all(
+      reviewers.map(async (reviewer) => {
+        const councilRes = await runOpenCodeFreeModel({
+          model: reviewer.id,
+          prompt: [
+            "COUNCIL_REVIEW",
+            "Do not call any tools (do not call read, glob, grep, or bash).",
+            `Cross-examine the following ${input.playbook} attempt (${attempt.id}) from ${attempt.model} (family=${attempt.family}):`,
+            attempt.output,
+            "If the output is coherent and satisfies the subtask, reply immediately on a single line with: VERDICT: APPROVE — <1 sentence summary>. Only reply VERDICT: CHALLENGE if the output is empty, contradictory, or fabricates broken claims.",
+          ].join("\n"),
+          cwd: attempt.worktreeDir ?? input.cwd,
+          timeoutMs: input.timeoutMs,
+          runner: input.openCodeRunner,
+        });
+        const isChallenge = /VERDICT:\s*CHALLENGE/i.test(councilRes.stdout);
+        const note: BurnCouncilNote = {
+          reviewerModel: reviewer.id,
+          reviewerFamily: reviewer.family,
+          targetAttemptId: attempt.id,
+          targetModel: attempt.model,
+          verdict: isChallenge ? "challenge" : "approve",
+          critique: councilRes.stdout || "Approved by cross-family Council.",
+          citationsVerified: attempt.citationResult ? attempt.citationResult.ok : true,
+        };
+        return note;
+      }),
+    );
+
+    input.councilNotes.push(...notesForAttempt);
+    const challenges = notesForAttempt.filter((n) => n.verdict === "challenge").length;
+    if (challenges > 0 && challenges >= Math.ceil(notesForAttempt.length / 2)) {
+      attempt.accepted = false;
+      attempt.rejectionReason = "Challenged by cross-family Council";
+    }
+  }
+}
+
+function modelBranchSlug(modelId: string): string {
+  const shortId = modelId.startsWith("opencode/") ? modelId.slice("opencode/".length) : modelId;
+  return shortId.replace(/[^a-zA-Z0-9._-]+/g, "-").replace(/^-+|-+$/g, "") || "model";
+}
+
+function prepareIsolatedWorktree(
+  projectRoot: string,
+  destDir: string,
+  branchName: string,
+): { worktreeDir: string; branchName?: string } {
   mkdirSync(dirname(destDir), { recursive: true });
-  try {
-    execFileSync("git", ["worktree", "add", "--detach", destDir, "HEAD"], {
-      cwd: projectRoot,
-      env: buildExtendedPathEnv(),
-      stdio: "ignore",
-      timeout: 10_000,
-    });
-  } catch {
+  const upstreamFactoryRoot = resolve(DEFAULT_UPSTREAM_ISSUES_DIR, "../../..");
+  const isUpstreamFactoryRepo = resolve(projectRoot) === upstreamFactoryRoot;
+  let createdBranch: string | undefined;
+  if (!isUpstreamFactoryRepo) {
+    try {
+      execFileSync("git", ["worktree", "add", "-B", branchName, destDir, "HEAD"], {
+        cwd: projectRoot,
+        env: buildExtendedPathEnv(),
+        stdio: "ignore",
+        timeout: 10_000,
+      });
+      createdBranch = branchName;
+    } catch {
+      // fall back to directory copy below
+    }
+  }
+  if (!createdBranch) {
     mkdirSync(destDir, { recursive: true });
     if (existsSync(projectRoot)) {
       cpSync(projectRoot, destDir, {
@@ -964,15 +1052,65 @@ function prepareIsolatedWorktree(projectRoot: string, destDir: string): string {
   }
 
   const parentNodeModules = join(projectRoot, "node_modules");
-  const targetNodeModules = join(destDir, "node_modules");
-  if (existsSync(parentNodeModules) && !existsSync(targetNodeModules)) {
+  const destNodeModules = join(destDir, "node_modules");
+  if (existsSync(parentNodeModules) && !existsSync(destNodeModules)) {
     try {
-      symlinkSync(parentNodeModules, targetNodeModules, "dir");
+      symlinkSync(parentNodeModules, destNodeModules, "dir");
     } catch {
       // ignore symlink failure
     }
   }
-  return destDir;
+  return { worktreeDir: destDir, branchName: createdBranch };
+}
+
+function finalizeWorktreeBranches(
+  projectRoot: string,
+  attempts: BurnAttemptRecord[],
+  winningBranch?: string,
+): void {
+  for (const attempt of attempts) {
+    if (attempt.worktreeDir) {
+      const symlinkedNm = join(attempt.worktreeDir, "node_modules");
+      try {
+        rmSync(symlinkedNm, { recursive: true, force: true });
+      } catch {
+        // ignore
+      }
+      try {
+        execFileSync("git", ["worktree", "remove", "--force", attempt.worktreeDir], {
+          cwd: projectRoot,
+          env: buildExtendedPathEnv(),
+          stdio: "ignore",
+          timeout: 10_000,
+        });
+      } catch {
+        rmSync(attempt.worktreeDir, { recursive: true, force: true });
+        try {
+          execFileSync("git", ["worktree", "prune"], {
+            cwd: projectRoot,
+            env: buildExtendedPathEnv(),
+            stdio: "ignore",
+            timeout: 5_000,
+          });
+        } catch {
+          // ignore
+        }
+      }
+    }
+
+    if (attempt.branchName && attempt.branchName !== winningBranch) {
+      try {
+        execFileSync("git", ["branch", "-D", attempt.branchName], {
+          cwd: projectRoot,
+          env: buildExtendedPathEnv(),
+          stdio: "ignore",
+          timeout: 5_000,
+        });
+      } catch {
+        // ignore if branch was not created
+      }
+    }
+  }
 }
 
 function updateFreePoolStatsFromAttempts(paseoHome: string, attempts: BurnAttemptRecord[]): void {
@@ -1069,6 +1207,7 @@ export async function runBurnPlaybook(input: {
 
   const execSupervisor = input.supervisorRunner ?? defaultSupervisorRunner;
   const execGate = input.gateRunner ?? defaultGateRunner;
+  let worktreeHostRoot = project.root;
 
   try {
     // Tier 1: Strong Supervisor Framing
@@ -1086,6 +1225,9 @@ export async function runBurnPlaybook(input: {
       cwd: project.root,
       timeoutMs,
     });
+    if (!framingRes.ok) {
+      throw new Error(framingRes.error ?? framingRes.stderr ?? "Supervisor framing failed");
+    }
 
     run.framing = parseFramingOutput(
       framingRes.stdout,
@@ -1122,10 +1264,10 @@ export async function runBurnPlaybook(input: {
         rejectionReason: m.healthy ? undefined : (m.error ?? "unhealthy"),
       }));
     } else if (input.playbook === "oss-lab") {
-      let targetRepoRoot = project.root;
+      let inspectRepoRoot = project.root;
       if (input.targetRepo) {
         if (existsSync(input.targetRepo)) {
-          targetRepoRoot = resolve(input.targetRepo);
+          inspectRepoRoot = resolve(input.targetRepo);
         } else if (/^(?:https?:\/\/|git@)/i.test(input.targetRepo)) {
           const cloneDir = join(artifactDir, "oss-repo");
           try {
@@ -1134,9 +1276,9 @@ export async function runBurnPlaybook(input: {
               stdio: "ignore",
               timeout: 30_000,
             });
-            targetRepoRoot = cloneDir;
+            inspectRepoRoot = cloneDir;
           } catch {
-            targetRepoRoot = project.root;
+            inspectRepoRoot = project.root;
           }
         }
       }
@@ -1151,9 +1293,9 @@ export async function runBurnPlaybook(input: {
         "src/index.ts",
         "src/app.ts",
       ];
-      if (existsSync(join(targetRepoRoot, "src"))) {
+      if (existsSync(join(inspectRepoRoot, "src"))) {
         try {
-          for (const f of readdirSync(join(targetRepoRoot, "src")).sort()) {
+          for (const f of readdirSync(join(inspectRepoRoot, "src")).sort()) {
             const rel = `src/${f}`;
             if (!candidateRelPaths.includes(rel)) candidateRelPaths.push(rel);
           }
@@ -1164,7 +1306,7 @@ export async function runBurnPlaybook(input: {
       const repoExcerpts: string[] = [];
       for (const rel of candidateRelPaths) {
         if (repoExcerpts.length >= 4) break;
-        const abs = join(targetRepoRoot, rel);
+        const abs = join(inspectRepoRoot, rel);
         if (!existsSync(abs)) continue;
         try {
           if (!statSync(abs).isFile()) continue;
@@ -1184,47 +1326,81 @@ export async function runBurnPlaybook(input: {
         }
       }
 
-      const swarmModels = selectSwarmModels(input.paseoHome, "reader-1m", 2);
+      const effectiveGateCommand =
+        input.gateCommand ?? run.framing?.gateCommand ?? "node -e \"process.exit(0)\"";
+
+      const coderModels = selectSwarmModels(input.paseoHome, "coder", 1);
+      const allReaders = selectSwarmModels(input.paseoHome, "reader-1m", 3);
+      const distinctReaders = allReaders
+        .filter((m) => !coderModels.some((c) => c.id === m.id))
+        .slice(0, 2);
+
+      const swarmAssignments: Array<{ model: FreeModelRecord; role: SwarmRole }> = [
+        ...distinctReaders.map((model) => ({ model, role: "reader-1m" as SwarmRole })),
+        ...coderModels.map((model) => ({ model, role: "coder" as SwarmRole })),
+      ];
+
       const rawAttempts = await Promise.all(
-        swarmModels.map(async (model, idx) => {
+        swarmAssignments.map(async ({ model, role }, idx) => {
+          const attemptId = `attempt-${idx + 1}`;
           const subtask =
-            run.framing?.subtasks[idx % (run.framing?.subtasks.length || 1)] ?? input.prompt;
+            role === "coder"
+              ? `Build and verify runnable mini-PoC for: ${input.prompt}`
+              : (run.framing?.subtasks[idx % (run.framing?.subtasks.length || 1)] ?? input.prompt);
+
+          let worktreeDir: string | undefined;
+          let branchName: string | undefined;
+          if (role === "coder") {
+            worktreeHostRoot = inspectRepoRoot;
+            const desiredBranch = `burn/${runId}/${modelBranchSlug(model.id)}`;
+            const wt = prepareIsolatedWorktree(
+              inspectRepoRoot,
+              join(artifactDir, "worktrees", attemptId),
+              desiredBranch,
+            );
+            worktreeDir = wt.worktreeDir;
+            branchName = wt.branchName;
+          }
+
           const res = await runOpenCodeFreeModel({
             model: model.id,
             prompt: [
-              `You are a ${model.family} reader-1m Free model in OSS Lab.`,
+              `You are a ${model.family} ${role} Free model in OSS Lab.`,
               "Do not call any tools (do not call read, glob, grep, or bash). Answer directly from the file excerpts below.",
               `Subtask: ${subtask}`,
-              `Target repository: ${targetRepoRoot}`,
-              `Every architectural claim MUST include exact [path:startLine-endLine] citations ONLY to the 4 real files shown below within their valid line counts (e.g. [README.md:1-2], [src/citation-gate.ts:1-15], [src/free-pool.ts:1-15]). Never write bracketed [path:line] for any other filename.`,
+              `Inspected repository: ${inspectRepoRoot}`,
+              ...(role === "coder" ? [`Mini-PoC Gate command: ${effectiveGateCommand}`] : []),
+              `Every architectural claim MUST include exact [path:startLine-endLine] citations ONLY to the real files shown below within their valid line counts (e.g. [README.md:1-2]). Never write bracketed [path:line] for any other filename.`,
               "",
               ...repoExcerpts,
             ].join("\n"),
-            cwd: targetRepoRoot,
+            cwd: worktreeDir ?? inspectRepoRoot,
             timeoutMs,
             runner: input.openCodeRunner,
           });
           return {
-            id: `attempt-${idx + 1}`,
+            id: attemptId,
             model: model.id,
             family: model.family,
-            role: "reader-1m" as SwarmRole,
+            role,
             subtask,
             ok: res.ok,
             latencyMs: res.latencyMs,
             output: res.stdout,
+            worktreeDir,
+            branchName,
           };
         }),
       );
 
       transition("verifying");
       for (const raw of rawAttempts) {
-        const citationResult = verifyCitations(targetRepoRoot, raw.output);
+        const citationResult = verifyCitations(inspectRepoRoot, raw.output);
         let gateResult: GateRunResult | undefined;
-        if (input.gateCommand) {
+        if (raw.role === "coder" || input.gateCommand) {
           gateResult = await execGate({
-            command: input.gateCommand,
-            cwd: targetRepoRoot,
+            command: effectiveGateCommand,
+            cwd: raw.worktreeDir ?? inspectRepoRoot,
             timeoutMs,
           });
         }
@@ -1252,45 +1428,37 @@ export async function runBurnPlaybook(input: {
         });
       }
 
-      // Cross-family Council verification over accepted attempts
-      for (const acceptedAttempt of run.attempts.filter((a) => a.accepted)) {
-        const reviewer = pickCrossFamilyReviewer(
-          input.paseoHome,
-          acceptedAttempt.family,
-          acceptedAttempt.model,
-        );
-        const councilRes = await runOpenCodeFreeModel({
-          model: reviewer.id,
-          prompt: [
-            "COUNCIL_REVIEW",
-            "Do not call any tools (do not call read, glob, grep, or bash).",
-            `Cross-examine the following OSS Lab report from ${acceptedAttempt.model} (${acceptedAttempt.family}):`,
-            acceptedAttempt.output,
-            "Reply immediately with VERDICT: APPROVE or VERDICT: CHALLENGE and a concise 1-2 sentence critique.",
-          ].join("\n"),
-          cwd: targetRepoRoot,
-          timeoutMs,
-          runner: input.openCodeRunner,
-        });
-        const isChallenge = /VERDICT:\s*CHALLENGE/i.test(councilRes.stdout);
-        run.councilNotes.push({
-          reviewerModel: reviewer.id,
-          reviewerFamily: reviewer.family,
-          targetAttemptId: acceptedAttempt.id,
-          targetModel: acceptedAttempt.model,
-          verdict: isChallenge ? "challenge" : "approve",
-          critique: councilRes.stdout || "Approved by cross-family Council.",
-          citationsVerified: Boolean(acceptedAttempt.citationResult?.ok),
-        });
+      await runCouncilCrossCheck({
+        paseoHome: input.paseoHome,
+        playbook: input.playbook,
+        cwd: inspectRepoRoot,
+        timeoutMs,
+        openCodeRunner: input.openCodeRunner,
+        attempts: run.attempts,
+        councilNotes: run.councilNotes,
+      });
+
+      const winners = run.attempts
+        .filter((a) => a.accepted)
+        .sort((a, b) => a.latencyMs - b.latencyMs);
+      if (winners[0]) {
+        run.winningAttemptId = winners[0].id;
+        run.winningModel = winners[0].model;
+      }
+      const winningCodeAttempt = winners.find((a) => a.branchName);
+      if (winningCodeAttempt?.branchName) {
+        run.winningBranch = winningCodeAttempt.branchName;
       }
 
+      finalizeWorktreeBranches(inspectRepoRoot, run.attempts, undefined);
       updateFreePoolStatsFromAttempts(input.paseoHome, run.attempts);
     } else {
       // proto-arena, night-shift, self-evolve
-      const targetRoot =
+      const arenaProjectRoot =
         input.playbook === "self-evolve" && existsSync(DEFAULT_SELF_REPO_ROOT) && !input.projectSlug
           ? DEFAULT_SELF_REPO_ROOT
           : project.root;
+      worktreeHostRoot = arenaProjectRoot;
       const swarmModels = selectSwarmModels(input.paseoHome, "coder", 2);
       const gateCommand =
         input.gateCommand ??
@@ -1302,9 +1470,11 @@ export async function runBurnPlaybook(input: {
       const rawAttempts = await Promise.all(
         swarmModels.map(async (model, idx) => {
           const attemptId = `attempt-${idx + 1}`;
-          const worktreeDir = prepareIsolatedWorktree(
-            targetRoot,
+          const desiredBranch = `burn/${runId}/${modelBranchSlug(model.id)}`;
+          const { worktreeDir, branchName } = prepareIsolatedWorktree(
+            arenaProjectRoot,
             join(artifactDir, "worktrees", attemptId),
+            desiredBranch,
           );
           const subtask =
             run.framing?.subtasks[idx % (run.framing?.subtasks.length || 1)] ?? input.prompt;
@@ -1329,6 +1499,7 @@ export async function runBurnPlaybook(input: {
             latencyMs: res.latencyMs,
             output: res.stdout,
             worktreeDir,
+            branchName,
           };
         }),
       );
@@ -1353,36 +1524,15 @@ export async function runBurnPlaybook(input: {
         });
       }
 
-      // Cross-family Council review on Gate-green attempts
-      for (const greenAttempt of run.attempts.filter((a) => a.accepted)) {
-        const reviewer = pickCrossFamilyReviewer(
-          input.paseoHome,
-          greenAttempt.family,
-          greenAttempt.model,
-        );
-        const councilRes = await runOpenCodeFreeModel({
-          model: reviewer.id,
-          prompt: [
-            "COUNCIL_REVIEW",
-            `Review Gate-green ${input.playbook} attempt ${greenAttempt.id} by ${greenAttempt.model}:`,
-            greenAttempt.output,
-            "Reply with VERDICT: APPROVE or VERDICT: CHALLENGE.",
-          ].join("\n"),
-          cwd: greenAttempt.worktreeDir ?? targetRoot,
-          timeoutMs,
-          runner: input.openCodeRunner,
-        });
-        const isChallenge = /VERDICT:\s*CHALLENGE/i.test(councilRes.stdout);
-        run.councilNotes.push({
-          reviewerModel: reviewer.id,
-          reviewerFamily: reviewer.family,
-          targetAttemptId: greenAttempt.id,
-          targetModel: greenAttempt.model,
-          verdict: isChallenge ? "challenge" : "approve",
-          critique: councilRes.stdout || "Gate-green attempt approved by Council.",
-          citationsVerified: true,
-        });
-      }
+      await runCouncilCrossCheck({
+        paseoHome: input.paseoHome,
+        playbook: input.playbook,
+        cwd: arenaProjectRoot,
+        timeoutMs,
+        openCodeRunner: input.openCodeRunner,
+        attempts: run.attempts,
+        councilNotes: run.councilNotes,
+      });
 
       const winners = run.attempts
         .filter((a) => a.accepted)
@@ -1390,8 +1540,12 @@ export async function runBurnPlaybook(input: {
       if (winners[0]) {
         run.winningAttemptId = winners[0].id;
         run.winningModel = winners[0].model;
+        if (winners[0].branchName) {
+          run.winningBranch = winners[0].branchName;
+        }
       }
 
+      finalizeWorktreeBranches(arenaProjectRoot, run.attempts, run.winningBranch);
       updateFreePoolStatsFromAttempts(input.paseoHome, run.attempts);
     }
 
@@ -1411,7 +1565,7 @@ export async function runBurnPlaybook(input: {
         ? verifiedAttempts
             .map(
               (a) =>
-                `### Attempt ${a.id} (${a.model}, family=${a.family}, latency=${a.latencyMs}ms)\n${a.output}`,
+                `### Attempt ${a.id} (${a.model}, family=${a.family}, role=${a.role}, latency=${a.latencyMs}ms)\n${a.output}`,
             )
             .join("\n\n")
         : "No Free model attempts passed the verification fence.";
@@ -1434,8 +1588,9 @@ export async function runBurnPlaybook(input: {
       prompt: [
         `You are the strong Supervisor (${project.supervisorLane}) synthesizing the final deliverable for ${input.playbook}.`,
         `Original Brief: ${input.prompt}`,
+        ...(run.winningBranch ? [`Verified Winning Branch: ${run.winningBranch}`] : []),
         "",
-        "## Verified Evidence (Cleared by Mechanical Gate / Citation Gate)",
+        "## Verified Evidence (Cleared by Mechanical Gate / Citation Gate / Council)",
         verifiedEvidenceBlock,
         "",
         "## Cross-Family Council Notes",
@@ -1444,6 +1599,9 @@ export async function runBurnPlaybook(input: {
       cwd: project.root,
       timeoutMs,
     });
+    if (!synthesisRes.ok) {
+      throw new Error(synthesisRes.error ?? synthesisRes.stderr ?? "Supervisor synthesis failed");
+    }
 
     const reportPath = join(artifactDir, "report.md");
     const reportMarkdown =
@@ -1457,6 +1615,7 @@ export async function runBurnPlaybook(input: {
     transition("completed");
     return run;
   } catch (err) {
+    finalizeWorktreeBranches(worktreeHostRoot, run.attempts, undefined);
     run.error = err instanceof Error ? err.message : String(err);
     transition("failed");
     return run;

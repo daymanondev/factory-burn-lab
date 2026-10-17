@@ -226,9 +226,11 @@ test("runBurnPlaybook oss-lab enforces Citation gate and cross-family Council be
     assert.equal(rejected.length >= 1, true);
     assert.match(rejected[0]?.rejectionReason ?? "", /Citation gate/i);
 
-    // Cross-family Council must use a different family than the target attempt
-    assert.equal(run.councilNotes.length >= 1, true);
-    assert.notEqual(run.councilNotes[0]?.reviewerFamily, "glm");
+    // Cross-family Council must use 2 distinct families different from the target attempt
+    assert.equal(run.councilNotes.length, 2);
+    for (const note of run.councilNotes) {
+      assert.notEqual(note.reviewerFamily, "glm");
+    }
 
     // Supervisor synthesis prompt must include verified evidence and exclude rejected hallucination
     const synthCall = supervisorCalls.find((c) => c.phase === "synthesizing");
@@ -251,6 +253,48 @@ test("runBurnPlaybook oss-lab enforces Citation gate and cross-family Council be
     const glmRecord = updatedPool.models.find((m) => m.id === "opencode/glm-5.3-flash-free");
     assert.equal(glmRecord?.wins, 2);
     assert.equal(glmRecord?.attempts, 2);
+
+    // Verify Council CHALLENGE verdict demotes an attempt to accepted = false
+    const challengedRun = await runBurnPlaybook({
+      paseoHome,
+      projectSlug: added.project.slug,
+      playbook: "oss-lab",
+      prompt: "Test Council challenge filtering",
+      targetRepo: repoDir,
+      supervisorRunner: async ({ phase }) => ({
+        ok: true,
+        stdout:
+          phase === "framing"
+            ? JSON.stringify({
+                goal: "Test Council challenge",
+                subtasks: ["Cite src/app.ts"],
+                gateCommand: "node -e \"process.exit(0)\"",
+                citationRequired: true,
+              })
+            : "# Challenged Report",
+      }),
+      openCodeRunner: async ({ prompt }) => {
+        if (prompt.includes("COUNCIL_REVIEW")) {
+          return {
+            ok: true,
+            stdout: "VERDICT: CHALLENGE — Subtle logic flaw in interpretation of [src/app.ts:1-3].",
+            stderr: "",
+            latencyMs: 100,
+          };
+        }
+        return {
+          ok: true,
+          stdout: "Claiming [src/app.ts:1-3] multiplies numbers.",
+          stderr: "",
+          latencyMs: 100,
+        };
+      },
+    });
+    assert.equal(challengedRun.attempts.every((a) => !a.accepted), true);
+    assert.match(
+      challengedRun.attempts[0]?.rejectionReason ?? "",
+      /Challenged by cross-family Council/i,
+    );
   } finally {
     rmSync(paseoHome, { recursive: true, force: true });
     rmSync(repoDir, { recursive: true, force: true });
@@ -323,7 +367,7 @@ test("runBurnPlaybook proto-arena, night-shift, self-evolve, and scout-pool exec
       }),
       openCodeRunner: async ({ model }) => ({
         ok: true,
-        stdout: `Prototype output from ${model}`,
+        stdout: `VERDICT: APPROVE — Prototype output from ${model}`,
         stderr: "",
         latencyMs: model.includes("glm") ? 150 : 260,
       }),
@@ -341,7 +385,13 @@ test("runBurnPlaybook proto-arena, night-shift, self-evolve, and scout-pool exec
 
     assert.equal(arenaRun.status, "completed");
     assert.equal(arenaRun.winningModel, "opencode/glm-5.3-flash-free");
+    assert.equal(arenaRun.winningBranch, `burn/${arenaRun.id}/glm-5.3-flash-free`);
     assert.equal(arenaRun.attempts.filter((a) => a.accepted).length, 1);
+    const branchesOut = execFileSync("git", ["branch", "--list", arenaRun.winningBranch!], {
+      cwd: repoDir,
+      encoding: "utf8",
+    });
+    assert.equal(branchesOut.includes(arenaRun.winningBranch!), true);
 
     // 2. Night Shift: isolated worktrees + Gate + Council
     const nightRun = await runBurnPlaybook({
@@ -433,7 +483,7 @@ test("runBurnPlaybook proto-arena, night-shift, self-evolve, and scout-pool exec
       scoutProbeRunner: async (model) => ({
         healthy: true,
         latencyMs: 190,
-        codeOutput: model.id.includes("glm") ? "FIXED_SUM=6" : "NOPE",
+        codeOutput: model.id.includes("glm") ? "n > 0 ? acc + n : acc\nFIXED_SUM=6" : "NOPE",
         citationOutput: "Cited [src/math.ts:1-3].",
       }),
       supervisorRunner: async () => ({

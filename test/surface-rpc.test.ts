@@ -110,7 +110,7 @@ test("burn.scout, burn.start, burn.detail, and burn.upstream.file execute playbo
       scoutProbeRunner: async (model) => ({
         healthy: true,
         latencyMs: model.id.includes("glm") ? 180 : 240,
-        codeOutput: "FIXED_SUM=6",
+        codeOutput: "n > 0 ? acc + n : acc\nFIXED_SUM=6",
         citationOutput: "Cited [src/math.ts:1-3].",
       }),
       supervisorRunner: async ({ phase }) => ({
@@ -317,47 +317,44 @@ test("burn.supervisor.open creates or reuses the Project's Supervisor seat agent
   }
 });
 
-test("trial and desktop Paseo homes register factory-burn-lab and render live Free pool, active Projects, and Upstream issue #01 cleanly", async () => {
-  const home = homedir();
-  const homes = [join(home, ".paseo-factory"), join(home, ".paseo")];
+test("createBurnSurfaceHandlers defaults to trial home ~/.paseo-factory when present and renders live state cleanly", async () => {
+  const trialHome = join(homedir(), ".paseo-factory");
+  const configPath = join(trialHome, "config.json");
+  if (!existsSync(configPath)) return;
 
-  for (const paseoHome of homes) {
-    const configPath = join(paseoHome, "config.json");
-    if (!existsSync(configPath)) continue;
+  const config = JSON.parse(readFileSync(configPath, "utf8")) as {
+    plugins?: Record<string, { source?: string; path?: string; enabled?: boolean }>;
+  };
+  assert.ok(config.plugins?.["paseo-factory"], `expected paseo-factory in ${configPath}`);
+  assert.deepEqual(config.plugins?.["factory-burn-lab"], {
+    source: "directory",
+    path: "/Users/andrewpham/Documents/code/self-project/factory-burn-lab/plugin",
+    enabled: true,
+  });
 
-    const config = JSON.parse(readFileSync(configPath, "utf8")) as {
-      plugins?: Record<string, { source?: string; path?: string; enabled?: boolean }>;
-    };
-    assert.ok(config.plugins?.["paseo-factory"], `expected paseo-factory in ${configPath}`);
-    assert.deepEqual(config.plugins?.["factory-burn-lab"], {
-      source: "directory",
-      path: "/Users/andrewpham/Documents/code/self-project/factory-burn-lab/plugin",
-      enabled: true,
-    });
+  const handlers = createBurnSurfaceHandlers({});
+  const snap = await handlers.snapshot({});
+  assert.equal(snap.ok, true);
+  if (!snap.ok) return;
 
-    const handlers = createBurnSurfaceHandlers({ paseoHome });
-    const snap = await handlers.snapshot({});
-    assert.equal(snap.ok, true);
-    if (!snap.ok) continue;
-
-    assert.equal(snap.view.kpis.totalFreeModels >= 10, true);
-    assert.equal(snap.view.kpis.healthyFreeModels >= 1, true);
-    assert.equal(snap.view.kpis.coderModels >= 1, true);
-    assert.equal(snap.view.kpis.reader1mModels >= 1, true);
-    assert.equal(snap.view.kpis.reviewerModels >= 1, true);
-    assert.equal(snap.view.projects.length >= 1, true);
-    assert.ok(snap.view.activeProject);
-    assert.equal(
-      snap.view.projects.some((p) => p.name === "factory-burn-lab"),
-      true,
-    );
-    assert.equal(snap.view.kpis.totalRuns >= 1, true);
-    assert.equal(snap.view.kpis.upstreamIssues >= 1, true);
-    const issue01 = snap.view.upstreamIssues.find((i) => i.number === "01");
-    assert.ok(issue01);
-    assert.equal(issue01.status, "needs-triage");
-    assert.equal(existsSync(join(paseoHome, "factory", "ledger.jsonl")), false);
-  }
+  assert.equal(snap.view.stateDir, join(trialHome, "burn-lab"));
+  assert.equal(snap.view.kpis.totalFreeModels >= 10, true);
+  assert.equal(snap.view.kpis.healthyFreeModels >= 1, true);
+  assert.equal(snap.view.kpis.coderModels >= 1, true);
+  assert.equal(snap.view.kpis.reader1mModels >= 1, true);
+  assert.equal(snap.view.kpis.reviewerModels >= 1, true);
+  assert.equal(snap.view.projects.length >= 1, true);
+  assert.ok(snap.view.activeProject);
+  assert.equal(
+    snap.view.projects.some((p) => p.name === "factory-burn-lab"),
+    true,
+  );
+  assert.equal(snap.view.kpis.totalRuns >= 1, true);
+  assert.equal(snap.view.kpis.upstreamIssues >= 1, true);
+  const issue01 = snap.view.upstreamIssues.find((i) => i.number === "01");
+  assert.ok(issue01);
+  assert.equal(issue01.status, "needs-triage");
+  assert.equal(existsSync(join(trialHome, "factory", "ledger.jsonl")), false);
 });
 
 

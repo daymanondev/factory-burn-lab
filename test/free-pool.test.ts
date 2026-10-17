@@ -132,7 +132,8 @@ test("scoutFreePool runs liveness, code-fix Gate, and Citation gate micro-batter
           return {
             healthy: true,
             latencyMs: 320,
-            codeOutput: "FIXED_SUM=6",
+            codeOutput:
+              "export function sumPositive(nums: number[]): number { return nums.reduce((acc, n) => (n > 0 ? acc + n : acc), 0); }\nFIXED_SUM=6",
             citationOutput: "Positive summation is implemented in [src/math.ts:1-3].",
           };
         }
@@ -140,7 +141,7 @@ test("scoutFreePool runs liveness, code-fix Gate, and Citation gate micro-batter
           return {
             healthy: true,
             latencyMs: 480,
-            codeOutput: "WRONG_ANSWER",
+            codeOutput: "FIXED_SUM=6",
             citationOutput: "Hallucinated file [src/nonexistent.ts:1-90].",
           };
         }
@@ -173,7 +174,7 @@ test("scoutFreePool runs liveness, code-fix Gate, and Citation gate micro-batter
     assert.equal(nemotron.healthy, true);
     assert.equal(nemotron.gatePassed, false);
     assert.equal(nemotron.citationPassed, false);
-    assert.deepEqual(nemotron.roles, ["reader-1m"]);
+    assert.deepEqual(nemotron.roles, []);
     assert.equal(nemotron.wins, 0);
     assert.equal(nemotron.attempts, 1);
 
@@ -190,7 +191,7 @@ test("scoutFreePool runs liveness, code-fix Gate, and Citation gate micro-batter
       listOutput,
       openCodeRunner: async () => ({
         ok: true,
-        stdout: "FIXED_SUM=6 verified in [src/math.ts:1-3]",
+        stdout: "n > 0 ? acc + n : acc\nFIXED_SUM=6 verified in [src/math.ts:1-3]",
         stderr: "",
         latencyMs: 210,
       }),

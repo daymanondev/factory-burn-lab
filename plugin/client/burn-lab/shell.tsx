@@ -1,6 +1,6 @@
 /**
  * The one `<BurnLabShell />` every Paseo surface entry renders:
- * global screen, workspace panel, and settings screen.
+ * global screen and workspace panel.
  * 100% UI-driven: Project selector + Pet Project initializer, 1-click
  * `Open Supervisor` bridge, 1-click `Scout Free Models`, 5 Burn Playbook
  * launchers (`OSS Lab`, `Proto Arena`, `Night Shift`, `Self-Evolve`,
@@ -46,6 +46,19 @@ import {
 
 export interface Navigation {
   openAgent(input: { agentId: string; serverId?: string }): void;
+}
+
+export interface PlaybookDraft {
+  brief: string;
+  targetRepo: string;
+  gateCommand: string;
+}
+
+export interface UpstreamIssueDraft {
+  title: string;
+  slug: string;
+  problem: string;
+  proposedChange: string;
 }
 
 interface PlaybookMeta {
@@ -199,14 +212,12 @@ export function BurnLabShell({
   navigation,
   serverId,
   initialTab = "playbooks",
-  showDiagnostics = false,
 }: {
   theme: PluginTheme;
   dir?: string;
   navigation?: Navigation;
   serverId?: string;
   initialTab?: BurnTabId;
-  showDiagnostics?: boolean;
 }) {
   const toast = useToast();
   const snapshotCall = useRpc(burnSnapshot);
@@ -235,16 +246,20 @@ export function BurnLabShell({
 
   // Playbook launcher state
   const [selectedPlaybook, setSelectedPlaybook] = useState<BurnPlaybookView>("oss-lab");
-  const [briefInput, setBriefInput] = useState(PLAYBOOKS[0]!.defaultPrompt);
-  const [targetRepoInput, setTargetRepoInput] = useState("");
-  const [gateCommandInput, setGateCommandInput] = useState("");
+  const [playbookDraft, setPlaybookDraft] = useState<PlaybookDraft>({
+    brief: PLAYBOOKS[0]!.defaultPrompt,
+    targetRepo: "",
+    gateCommand: "",
+  });
   const [runFilter, setRunFilter] = useState<"all" | "active" | "completed" | "failed">("all");
 
   // Upstream issue form state
-  const [issueTitle, setIssueTitle] = useState("");
-  const [issueSlug, setIssueSlug] = useState("");
-  const [issueProblem, setIssueProblem] = useState("");
-  const [issueChange, setIssueChange] = useState("");
+  const [issueDraft, setIssueDraft] = useState<UpstreamIssueDraft>({
+    title: "",
+    slug: "",
+    problem: "",
+    proposedChange: "",
+  });
   const [expandedIssueId, setExpandedIssueId] = useState<string | null>(null);
 
   const refresh = () => setBump((n) => n + 1);
@@ -325,10 +340,14 @@ export function BurnLabShell({
 
   const handleSelectPlaybook = (pb: PlaybookMeta) => {
     setSelectedPlaybook(pb.id);
-    setBriefInput(pb.defaultPrompt);
-    if (pb.id === "self-evolve" && !gateCommandInput) {
-      setGateCommandInput("npm test && npm run check:bundle");
-    }
+    setPlaybookDraft((prev) => ({
+      ...prev,
+      brief: pb.defaultPrompt,
+      gateCommand:
+        pb.id === "self-evolve" && !prev.gateCommand
+          ? "npm test && npm run check:bundle"
+          : prev.gateCommand,
+    }));
   };
 
   const handleScoutFreeModels = () => {
@@ -345,7 +364,7 @@ export function BurnLabShell({
   };
 
   const handleStartBurnRun = () => {
-    const prompt = briefInput.trim();
+    const prompt = playbookDraft.brief.trim();
     if (!prompt) {
       toast.error("Enter a brief or goal for the Burn run");
       return;
@@ -356,8 +375,8 @@ export function BurnLabShell({
         playbook: selectedPlaybook,
         prompt,
         projectSlug: activeProject?.slug,
-        targetRepo: targetRepoInput.trim() || undefined,
-        gateCommand: gateCommandInput.trim() || undefined,
+        targetRepo: playbookDraft.targetRepo.trim() || undefined,
+        gateCommand: playbookDraft.gateCommand.trim() || undefined,
         awaitCompletion: true,
       });
       if (res.ok) {
@@ -409,25 +428,22 @@ export function BurnLabShell({
   };
 
   const handleFileUpstreamIssue = () => {
-    const title = issueTitle.trim();
-    const problem = issueProblem.trim();
-    const proposedChange = issueChange.trim();
+    const title = issueDraft.title.trim();
+    const problem = issueDraft.problem.trim();
+    const proposedChange = issueDraft.proposedChange.trim();
     if (!title || !problem || !proposedChange) {
       toast.error("Provide title, problem, and proposed change for the Upstream issue");
       return;
     }
     void runAction("File Upstream Issue", async () => {
       const res = await upstreamFileCall({
-        slug: issueSlug.trim() || title,
+        slug: issueDraft.slug.trim() || title,
         title,
         problem,
         proposedChange,
       });
       if (res.ok) {
-        setIssueTitle("");
-        setIssueSlug("");
-        setIssueProblem("");
-        setIssueChange("");
+        setIssueDraft({ title: "", slug: "", problem: "", proposedChange: "" });
         setStatusNote(
           `Filed upstream issue ${res.issue.id} (Status: ${res.issue.status}) in paseo-factory`,
         );
@@ -766,17 +782,6 @@ export function BurnLabShell({
           </Card>
         ) : null}
 
-        {showDiagnostics ? (
-          <Card theme={theme} gap={SPACING[1]}>
-            <Text style={text(theme, "section")}>Burn Lab Diagnostics</Text>
-            <Text style={text(theme, "code")}>stateDir: {view.stateDir}</Text>
-            <Text style={text(theme, "code")}>supervisorLane: {view.supervisorLane}</Text>
-            <Text style={text(theme, "code")}>
-              activeProject: {activeProject ? `${activeProject.slug} (${activeProject.root})` : "none"}
-            </Text>
-          </Card>
-        ) : null}
-
         {/* Navigation Tabs */}
         <BurnTabBar
           theme={theme}
@@ -796,12 +801,8 @@ export function BurnLabShell({
             busy={busy}
             selectedPlaybook={selectedPlaybook}
             onSelectPlaybook={handleSelectPlaybook}
-            briefInput={briefInput}
-            onChangeBrief={setBriefInput}
-            targetRepoInput={targetRepoInput}
-            onChangeTargetRepo={setTargetRepoInput}
-            gateCommandInput={gateCommandInput}
-            onChangeGateCommand={setGateCommandInput}
+            draft={playbookDraft}
+            onChangeDraft={setPlaybookDraft}
             onStartBurnRun={handleStartBurnRun}
             runFilter={runFilter}
             onChangeRunFilter={setRunFilter}
@@ -823,14 +824,8 @@ export function BurnLabShell({
             theme={theme}
             issues={view.upstreamIssues}
             busy={busy}
-            issueTitle={issueTitle}
-            onChangeTitle={setIssueTitle}
-            issueSlug={issueSlug}
-            onChangeSlug={setIssueSlug}
-            issueProblem={issueProblem}
-            onChangeProblem={setIssueProblem}
-            issueChange={issueChange}
-            onChangeProposed={setIssueChange}
+            draft={issueDraft}
+            onChangeDraft={setIssueDraft}
             onSubmitIssue={handleFileUpstreamIssue}
             expandedIssueId={expandedIssueId}
             onToggleExpand={(id) => setExpandedIssueId((prev) => (prev === id ? null : id))}
@@ -874,12 +869,8 @@ function PlaybooksAndRunsPane({
   busy,
   selectedPlaybook,
   onSelectPlaybook,
-  briefInput,
-  onChangeBrief,
-  targetRepoInput,
-  onChangeTargetRepo,
-  gateCommandInput,
-  onChangeGateCommand,
+  draft,
+  onChangeDraft,
   onStartBurnRun,
   runFilter,
   onChangeRunFilter,
@@ -890,12 +881,8 @@ function PlaybooksAndRunsPane({
   busy: boolean;
   selectedPlaybook: BurnPlaybookView;
   onSelectPlaybook: (pb: PlaybookMeta) => void;
-  briefInput: string;
-  onChangeBrief: (val: string) => void;
-  targetRepoInput: string;
-  onChangeTargetRepo: (val: string) => void;
-  gateCommandInput: string;
-  onChangeGateCommand: (val: string) => void;
+  draft: PlaybookDraft;
+  onChangeDraft: (updater: (prev: PlaybookDraft) => PlaybookDraft) => void;
   onStartBurnRun: () => void;
   runFilter: "all" | "active" | "completed" | "failed";
   onChangeRunFilter: (f: "all" | "active" | "completed" | "failed") => void;
@@ -992,8 +979,8 @@ function PlaybooksAndRunsPane({
             }}
           >
             <TextInput
-              value={briefInput}
-              onChangeText={onChangeBrief}
+              value={draft.brief}
+              onChangeText={(val) => onChangeDraft((prev) => ({ ...prev, brief: val }))}
               multiline
               placeholder="Describe the research question, prototype specification, or codebase goal…"
               placeholderTextColor={theme.colors.foregroundMuted}
@@ -1020,8 +1007,8 @@ function PlaybooksAndRunsPane({
               }}
             >
               <TextInput
-                value={targetRepoInput}
-                onChangeText={onChangeTargetRepo}
+                value={draft.targetRepo}
+                onChangeText={(val) => onChangeDraft((prev) => ({ ...prev, targetRepo: val }))}
                 placeholder="Optional Target Repo Path or GitHub URL (defaults to active Project)"
                 placeholderTextColor={theme.colors.foregroundMuted}
                 style={{
@@ -1045,8 +1032,8 @@ function PlaybooksAndRunsPane({
               }}
             >
               <TextInput
-                value={gateCommandInput}
-                onChangeText={onChangeGateCommand}
+                value={draft.gateCommand}
+                onChangeText={(val) => onChangeDraft((prev) => ({ ...prev, gateCommand: val }))}
                 placeholder="Optional Gate Command override (e.g. npm test)"
                 placeholderTextColor={theme.colors.foregroundMuted}
                 style={{
@@ -1063,7 +1050,7 @@ function PlaybooksAndRunsPane({
               icon="Flame"
               label={busy ? "Running Swarm…" : `Start ${currentMeta.title} Run`}
               tone="accent"
-              disabled={busy || briefInput.trim() === ""}
+              disabled={busy || draft.brief.trim() === ""}
               onPress={onStartBurnRun}
             />
           </View>
@@ -1336,14 +1323,8 @@ function UpstreamIssuesPane({
   theme,
   issues,
   busy,
-  issueTitle,
-  onChangeTitle,
-  issueSlug,
-  onChangeSlug,
-  issueProblem,
-  onChangeProblem,
-  issueChange,
-  onChangeProposed,
+  draft,
+  onChangeDraft,
   onSubmitIssue,
   expandedIssueId,
   onToggleExpand,
@@ -1351,14 +1332,8 @@ function UpstreamIssuesPane({
   theme: PluginTheme;
   issues: UpstreamIssueView[];
   busy: boolean;
-  issueTitle: string;
-  onChangeTitle: (v: string) => void;
-  issueSlug: string;
-  onChangeSlug: (v: string) => void;
-  issueProblem: string;
-  onChangeProblem: (v: string) => void;
-  issueChange: string;
-  onChangeProposed: (v: string) => void;
+  draft: UpstreamIssueDraft;
+  onChangeDraft: (updater: (prev: UpstreamIssueDraft) => UpstreamIssueDraft) => void;
   onSubmitIssue: () => void;
   expandedIssueId: string | null;
   onToggleExpand: (id: string) => void;
@@ -1389,8 +1364,8 @@ function UpstreamIssuesPane({
             }}
           >
             <TextInput
-              value={issueTitle}
-              onChangeText={onChangeTitle}
+              value={draft.title}
+              onChangeText={(v) => onChangeDraft((prev) => ({ ...prev, title: v }))}
               placeholder="Issue Title (e.g. Expose worktree snapshot hook)"
               placeholderTextColor={theme.colors.foregroundMuted}
               style={{
@@ -1414,8 +1389,8 @@ function UpstreamIssuesPane({
             }}
           >
             <TextInput
-              value={issueSlug}
-              onChangeText={onChangeSlug}
+              value={draft.slug}
+              onChangeText={(v) => onChangeDraft((prev) => ({ ...prev, slug: v }))}
               placeholder="Optional slug (e.g. worktree-hook)"
               placeholderTextColor={theme.colors.foregroundMuted}
               style={{
@@ -1438,8 +1413,8 @@ function UpstreamIssuesPane({
           }}
         >
           <TextInput
-            value={issueProblem}
-            onChangeText={onChangeProblem}
+            value={draft.problem}
+            onChangeText={(v) => onChangeDraft((prev) => ({ ...prev, problem: v }))}
             multiline
             placeholder="Problem: What capability or primitive is missing in paseo-factory?"
             placeholderTextColor={theme.colors.foregroundMuted}
@@ -1462,8 +1437,8 @@ function UpstreamIssuesPane({
           }}
         >
           <TextInput
-            value={issueChange}
-            onChangeText={onChangeProposed}
+            value={draft.proposedChange}
+            onChangeText={(v) => onChangeDraft((prev) => ({ ...prev, proposedChange: v }))}
             multiline
             placeholder="Proposed Change: How should paseo-factory expose this cleanly?"
             placeholderTextColor={theme.colors.foregroundMuted}
@@ -1484,9 +1459,9 @@ function UpstreamIssuesPane({
           tone="accent"
           disabled={
             busy ||
-            issueTitle.trim() === "" ||
-            issueProblem.trim() === "" ||
-            issueChange.trim() === ""
+            draft.title.trim() === "" ||
+            draft.problem.trim() === "" ||
+            draft.proposedChange.trim() === ""
           }
           onPress={onSubmitIssue}
         />

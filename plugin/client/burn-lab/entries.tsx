@@ -1,6 +1,6 @@
 /**
- * Burn Lab client surface entries: global screen, workspace panel, settings
- * screen, and sidebar header item (`Flame` icon).
+ * Burn Lab client surface entries: global screen, workspace panel, and sidebar
+ * header item (`Flame` icon).
  */
 import type {
   PluginSidebarItemProps,
@@ -15,18 +15,6 @@ export const SCREEN_ID = "factory-burn-lab";
 
 export function BurnLabScreen({ theme, navigation, host }: PluginSurfaceProps) {
   return <BurnLabShell theme={theme} navigation={navigation} serverId={host.id} />;
-}
-
-export function BurnLabSettings({ theme, navigation, host }: PluginSurfaceProps) {
-  return (
-    <BurnLabShell
-      theme={theme}
-      navigation={navigation}
-      serverId={host.id}
-      initialTab="pool"
-      showDiagnostics
-    />
-  );
 }
 
 export function BurnLabPanel({

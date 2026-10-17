@@ -5,6 +5,7 @@
  * and Factory Upstream Issues, while maintaining zero contamination of
  * `paseo-factory`'s ledger.
  */
+import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { PluginServerContext } from "@getpaseo/plugin/server";
@@ -16,6 +17,7 @@ import {
   type GateRunner,
   listBurnRuns,
   loadBurnRun,
+  parseSupervisorLane,
   resolveBurnProjects,
   resolveProjectIdentity,
   resolveSupervisorLane,
@@ -98,11 +100,30 @@ export interface BurnSurfaceDeps {
   onLog?: (message: string) => void;
 }
 
-export function resolvePaseoHome(env: NodeJS.ProcessEnv = process.env, homeDir: string = homedir()): string {
-  const raw = env.PASEO_HOME && env.PASEO_HOME.trim() !== "" ? env.PASEO_HOME.trim() : join(homeDir, ".paseo");
+export function resolvePaseoHome(
+  env: NodeJS.ProcessEnv = process.env,
+  homeDir: string = homedir(),
+): string {
+  const trialHome = join(homeDir, ".paseo-factory");
+  const defaultHome = existsSync(trialHome) ? trialHome : join(homeDir, ".paseo");
+  const raw =
+    env.PASEO_HOME && env.PASEO_HOME.trim() !== "" ? env.PASEO_HOME.trim() : defaultHome;
   if (raw === "~") return homeDir;
   if (raw.startsWith("~/")) return join(homeDir, raw.slice(2));
   return raw;
+}
+
+async function findLiveSupervisorAgent(
+  daemon: BurnDaemonApi,
+  projectSlug: string,
+): Promise<BurnDaemonAgentSnapshot | undefined> {
+  const page = await daemon.agents.list({
+    filter: {
+      labels: { seat: "supervisor", project: projectSlug },
+      includeArchived: false,
+    },
+  });
+  return page.entries.find((e) => e.agent.archivedAt === null)?.agent;
 }
 
 function summarizeRun(run: BurnRunRecord): BurnRunSummaryView {
@@ -237,13 +258,7 @@ export function createBurnSurfaceHandlers(deps: BurnSurfaceDeps = {}) {
       const daemon = resolveDaemon(context);
       if (daemon && activeProject) {
         try {
-          const page = await daemon.agents.list({
-            filter: {
-              labels: { seat: "supervisor", project: activeProject.slug },
-              includeArchived: false,
-            },
-          });
-          const live = page.entries.find((e) => e.agent.archivedAt === null)?.agent;
+          const live = await findLiveSupervisorAgent(daemon, activeProject.slug);
           if (live) {
             supervisorLive = true;
             supervisorAgentId = live.id;
@@ -358,7 +373,7 @@ export function createBurnSurfaceHandlers(deps: BurnSurfaceDeps = {}) {
       }
 
       try {
-        const job = runBurnPlaybook({
+        const burnRunPromise = runBurnPlaybook({
           paseoHome,
           playbook: input.playbook,
           prompt: trimmedPrompt,
@@ -375,14 +390,14 @@ export function createBurnSurfaceHandlers(deps: BurnSurfaceDeps = {}) {
         });
 
         if (input.awaitCompletion === false) {
-          void job.catch(() => {});
+          void burnRunPromise.catch(() => {});
           const latest = listBurnRuns(paseoHome)[0];
           if (latest) {
             return { ok: true as const, run: summarizeRun(latest) };
           }
         }
 
-        const completedRun = await job;
+        const completedRun = await burnRunPromise;
         return {
           ok: true as const,
           run: summarizeRun(completedRun),
@@ -460,20 +475,11 @@ export function createBurnSurfaceHandlers(deps: BurnSurfaceDeps = {}) {
 
       const supervisorLane =
         project.supervisorLane || resolveSupervisorLane(paseoHome, project.slug);
-      const colonIdx = supervisorLane.lastIndexOf(":");
-      const hasThinking = colonIdx > supervisorLane.indexOf("/");
-      const providerSpec = hasThinking ? supervisorLane.slice(0, colonIdx) : supervisorLane;
-      const thinkingOptionId = hasThinking ? supervisorLane.slice(colonIdx + 1) : undefined;
+      const parsedLane = parseSupervisorLane(supervisorLane);
 
       let existingAgent: BurnDaemonAgentSnapshot | undefined;
       try {
-        const page = await daemon.agents.list({
-          filter: {
-            labels: { seat: "supervisor", project: project.slug },
-            includeArchived: false,
-          },
-        });
-        existingAgent = page.entries.find((e) => e.agent.archivedAt === null)?.agent;
+        existingAgent = await findLiveSupervisorAgent(daemon, project.slug);
       } catch (err) {
         return failure(
           "daemon-list-failed",
@@ -487,9 +493,9 @@ export function createBurnSurfaceHandlers(deps: BurnSurfaceDeps = {}) {
       if (!existingAgent) {
         try {
           const handle = await daemon.agents.create({
-            config: thinkingOptionId
-              ? { provider: providerSpec, thinkingOptionId }
-              : { provider: providerSpec },
+            config: parsedLane.thinking
+              ? { provider: parsedLane.providerSpec, thinkingOptionId: parsedLane.thinking }
+              : { provider: parsedLane.providerSpec },
             cwd: project.root,
             title: "Factory Supervisor",
             labels: { seat: "supervisor", project: project.slug },

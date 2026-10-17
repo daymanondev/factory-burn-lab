@@ -10,6 +10,7 @@ import {
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { runInNewContext } from "node:vm";
 import { verifyCitations } from "./citation-gate.ts";
 
 export type SwarmRole = "coder" | "reader-1m" | "reviewer";
@@ -131,25 +132,25 @@ export function saveFreePool(paseoHome: string, state: FreePoolState): void {
   writeFileSync(path, `${JSON.stringify(state, null, 2)}\n`, "utf8");
 }
 
-export function resolveOpenCodeBinary(): string {
-  const candidates: string[] = [];
-  const home = homedir();
+export function candidateBinDirs(home: string = homedir()): string[] {
+  const dirs: string[] = [];
   const nvmDir = join(home, ".nvm", "versions", "node");
   if (existsSync(nvmDir)) {
     try {
       for (const ver of readdirSync(nvmDir).sort().reverse()) {
-        candidates.push(join(nvmDir, ver, "bin", "opencode"));
+        dirs.push(join(nvmDir, ver, "bin"));
       }
     } catch {
       // ignore
     }
   }
-  candidates.push(
-    join(home, ".local", "bin", "opencode"),
-    "/opt/homebrew/bin/opencode",
-    "/usr/local/bin/opencode",
-  );
-  for (const candidate of candidates) {
+  dirs.push(join(home, ".local", "bin"), "/opt/homebrew/bin", "/usr/local/bin");
+  return dirs;
+}
+
+export function resolveOpenCodeBinary(): string {
+  for (const dir of candidateBinDirs()) {
+    const candidate = join(dir, "opencode");
     if (existsSync(candidate)) {
       return candidate;
     }
@@ -158,23 +159,10 @@ export function resolveOpenCodeBinary(): string {
 }
 
 export function buildExtendedPathEnv(): NodeJS.ProcessEnv {
-  const home = homedir();
-  const extraPaths: string[] = [];
-  const nvmDir = join(home, ".nvm", "versions", "node");
-  if (existsSync(nvmDir)) {
-    try {
-      for (const ver of readdirSync(nvmDir).sort().reverse()) {
-        extraPaths.push(join(nvmDir, ver, "bin"));
-      }
-    } catch {
-      // ignore
-    }
-  }
-  extraPaths.push(join(home, ".local", "bin"), "/opt/homebrew/bin", "/usr/local/bin");
   const currentPath = process.env.PATH ?? "";
   return {
     ...process.env,
-    PATH: [...extraPaths, currentPath].filter(Boolean).join(":"),
+    PATH: [...candidateBinDirs(), currentPath].filter(Boolean).join(":"),
   };
 }
 
@@ -420,13 +408,51 @@ export async function runOpenCodeFreeModel(input: {
   }
 }
 
-function evaluateCodeGateProbe(output: string): boolean {
+export function evaluateCodeGateProbe(output: string): boolean {
   const trimmed = output.trim();
   if (!trimmed) return false;
-  if (trimmed.includes("FIXED_SUM=6") || /\bsumPositive\b/.test(trimmed)) {
-    return true;
+
+  // 1. If output contains a JS/TS function sumPositive, execute it in node:vm against test vectors
+  const fnMatch = trimmed.match(
+    /(?:export\s+)?function\s+sumPositive\s*\([^)]*\)\s*(?::\s*[A-Za-z0-9_[\]]+\s*)?\{[\s\S]*?\}/,
+  );
+  if (fnMatch) {
+    const jsCode = fnMatch[0]
+      .replace(/^export\s+/, "")
+      .replace(/:\s*number\[\]/g, "")
+      .replace(/\)\s*:\s*number\s*\{/, ") {");
+    try {
+      const ok = runInNewContext(
+        `${jsCode}; sumPositive([2, -3, 4]) === 6 && sumPositive([-5, 10, 0, 5]) === 15;`,
+        {},
+        { timeout: 500 },
+      );
+      if (ok === true) return true;
+    } catch {
+      // fall through to expression check
+    }
   }
-  return false;
+
+  // 2. Verify computed FIXED_SUM=6 (never in prompt) alongside the fixed positive-sum expression executed in node:vm
+  if (!/\bFIXED_SUM\s*=\s*6\b/.test(trimmed)) {
+    return false;
+  }
+  const hasFixExpr =
+    /n\s*>\s*0\s*\?\s*acc\s*\+\s*n\s*:\s*acc/.test(trimmed) ||
+    /filter\(\s*\(?n\)?\s*=>\s*n\s*>\s*0\s*\)/.test(trimmed);
+  if (!hasFixExpr) {
+    return false;
+  }
+  try {
+    const ok = runInNewContext(
+      `const sumPositive = (nums) => nums.reduce((acc, n) => (n > 0 ? acc + n : acc), 0); sumPositive([2, -3, 4]) === 6 && sumPositive([-5, 10, 0, 5]) === 15;`,
+      {},
+      { timeout: 500 },
+    );
+    return ok === true;
+  } catch {
+    return false;
+  }
 }
 
 export function assignSwarmRoles(input: {
@@ -438,7 +464,7 @@ export function assignSwarmRoles(input: {
   if (!input.healthy) return [];
   const roles: SwarmRole[] = [];
   if (input.gatePassed) roles.push("coder");
-  if (input.contextWindow >= 200_000 || input.citationPassed) roles.push("reader-1m");
+  if (input.citationPassed && input.contextWindow >= 200_000) roles.push("reader-1m");
   if (input.citationPassed) roles.push("reviewer");
   return roles;
 }
@@ -519,8 +545,8 @@ export async function scoutFreePool(input: {
     writeFileSync(
       join(fixtureRepoDir, "src", "math.ts"),
       [
-        "export function sumPositive(values: number[]): number {",
-        "  return values.filter((n) => n > 0).reduce((a, b) => a + b, 0);",
+        "export function sumPositive(nums: number[]): number {",
+        "  return nums.reduce((acc, n) => (n >= 0 ? acc - n : acc), 0);",
         "}",
       ].join("\n") + "\n",
       "utf8",
@@ -562,11 +588,12 @@ export async function scoutFreePool(input: {
         const prompt = [
           "You are being benchmarked by factory-burn-lab Scout pool.",
           "Do not call any tools (do not call read, glob, grep, or bash).",
-          "Given file src/math.ts (lines 1-3):",
-          "1: export function sumPositive(values: number[]): number {",
-          "2:   return values.filter((n) => n > 0).reduce((a, b) => a + b, 0);",
+          "Given buggy file src/math.ts (lines 1-3):",
+          "1: export function sumPositive(nums: number[]): number {",
+          "2:   return nums.reduce((acc, n) => (n >= 0 ? acc - n : acc), 0);",
           "3: }",
-          "Reply immediately with a single line containing: FIXED_SUM=6 and the exact citation [src/math.ts:1-3]",
+          "Fix sumPositive(nums) so it sums only positive numbers (replace the reducer body so n > 0 adds n to acc), compute FIXED_SUM=<result> for sumPositive([2, -3, 4]), and include the exact citation [src/math.ts:1-3].",
+          "Reply on a single line with: the fixed JS function `function sumPositive(nums) { ... }`, `FIXED_SUM=<result>`, and `[src/math.ts:1-3]`.",
         ].join(" ");
         const runRes = await runOpenCodeFreeModel({
           model: candidate.id,
