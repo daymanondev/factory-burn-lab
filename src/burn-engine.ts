@@ -278,13 +278,32 @@ function parseProjectEntry(
   source: BurnProject["source"],
   fallbackSlug?: string,
 ): BurnProject | null {
+  if (raw.archivedAt !== undefined && raw.archivedAt !== null) {
+    return null;
+  }
   const rawRoot =
     (typeof raw.root === "string" && raw.root) ||
+    (typeof raw.rootPath === "string" && raw.rootPath) ||
     (typeof raw.path === "string" && raw.path) ||
     (typeof raw.cwd === "string" && raw.cwd) ||
     (typeof raw.projectRoot === "string" && raw.projectRoot) ||
     "";
-  if (!rawRoot) return null;
+  if (!rawRoot || !existsSync(rawRoot)) return null;
+
+  const isTempHome =
+    paseoHome.startsWith("/tmp/") ||
+    paseoHome.startsWith("/private/tmp/") ||
+    paseoHome.startsWith("/var/folders/");
+  if (
+    !isTempHome &&
+    (rawRoot.startsWith("/tmp/") ||
+      rawRoot.startsWith("/private/tmp/") ||
+      rawRoot.includes("/.paseo-factory/plugin-state/") ||
+      rawRoot.includes("/.paseo-factory-supervisor") ||
+      rawRoot.includes("/factory-live"))
+  ) {
+    return null;
+  }
 
   const identity = resolveProjectIdentity(rawRoot);
   const slug =
@@ -295,6 +314,8 @@ function parseProjectEntry(
   const root = identity.ok ? identity.root : resolve(rawRoot);
   const name =
     (typeof raw.name === "string" && raw.name.trim()) ||
+    (typeof raw.customName === "string" && raw.customName.trim()) ||
+    (typeof raw.displayName === "string" && raw.displayName.trim()) ||
     basename(root);
   const supervisorLane =
     (typeof raw.supervisorLane === "string" && raw.supervisorLane.trim()) ||
@@ -859,7 +880,9 @@ function selectSwarmModels(
   }
 
   const withRole = healthy.filter((m) => m.roles.includes(preferredRole));
-  const candidates = withRole.length > 0 ? withRole : healthy;
+  const candidates = [...(withRole.length > 0 ? withRole : healthy)].sort(
+    (a, b) => (b.wins - a.wins) || ((a.latencyMs ?? 999_999) - (b.latencyMs ?? 999_999)),
+  );
 
   // Prioritize distinct model families first
   const selected: FreeModelRecord[] = [];
@@ -1118,6 +1141,49 @@ export async function runBurnPlaybook(input: {
         }
       }
 
+      const candidateRelPaths = [
+        "README.md",
+        "package.json",
+        "src/citation-gate.ts",
+        "src/free-pool.ts",
+        "src/burn-engine.ts",
+        "src/upstream.ts",
+        "src/index.ts",
+        "src/app.ts",
+      ];
+      if (existsSync(join(targetRepoRoot, "src"))) {
+        try {
+          for (const f of readdirSync(join(targetRepoRoot, "src")).sort()) {
+            const rel = `src/${f}`;
+            if (!candidateRelPaths.includes(rel)) candidateRelPaths.push(rel);
+          }
+        } catch {
+          // ignore
+        }
+      }
+      const repoExcerpts: string[] = [];
+      for (const rel of candidateRelPaths) {
+        if (repoExcerpts.length >= 4) break;
+        const abs = join(targetRepoRoot, rel);
+        if (!existsSync(abs)) continue;
+        try {
+          if (!statSync(abs).isFile()) continue;
+          const rawContent = readFileSync(abs, "utf8").replace(/\r?\n$/, "");
+          const lines = rawContent.length === 0 ? [] : rawContent.split(/\r?\n/);
+          if (lines.length === 0) continue;
+          const maxExcerpt = Math.min(lines.length, 20);
+          const numbered = lines
+            .slice(0, maxExcerpt)
+            .map((line, i) => `${i + 1}: ${line}`)
+            .join("\n");
+          repoExcerpts.push(
+            `File ${rel} (total lines: 1-${lines.length}; valid citation example: [${rel}:1-${Math.min(lines.length, 3)}]):\n${numbered}`,
+          );
+        } catch {
+          // ignore unreadable file
+        }
+      }
+
       const swarmModels = selectSwarmModels(input.paseoHome, "reader-1m", 2);
       const rawAttempts = await Promise.all(
         swarmModels.map(async (model, idx) => {
@@ -1127,9 +1193,12 @@ export async function runBurnPlaybook(input: {
             model: model.id,
             prompt: [
               `You are a ${model.family} reader-1m Free model in OSS Lab.`,
+              "Do not call any tools (do not call read, glob, grep, or bash). Answer directly from the file excerpts below.",
               `Subtask: ${subtask}`,
               `Target repository: ${targetRepoRoot}`,
-              `Every architectural claim MUST include exact [path:startLine-endLine] citations to real files in the repository.`,
+              `Every architectural claim MUST include exact [path:startLine-endLine] citations ONLY to the 4 real files shown below within their valid line counts (e.g. [README.md:1-2], [src/citation-gate.ts:1-15], [src/free-pool.ts:1-15]). Never write bracketed [path:line] for any other filename.`,
+              "",
+              ...repoExcerpts,
             ].join("\n"),
             cwd: targetRepoRoot,
             timeoutMs,
@@ -1194,9 +1263,10 @@ export async function runBurnPlaybook(input: {
           model: reviewer.id,
           prompt: [
             "COUNCIL_REVIEW",
+            "Do not call any tools (do not call read, glob, grep, or bash).",
             `Cross-examine the following OSS Lab report from ${acceptedAttempt.model} (${acceptedAttempt.family}):`,
             acceptedAttempt.output,
-            "Reply with VERDICT: APPROVE or VERDICT: CHALLENGE and your critique.",
+            "Reply immediately with VERDICT: APPROVE or VERDICT: CHALLENGE and a concise 1-2 sentence critique.",
           ].join("\n"),
           cwd: targetRepoRoot,
           timeoutMs,

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { createBurnSurfaceHandlers } from "../plugin/server/surface-rpc.ts";
@@ -314,6 +314,49 @@ test("burn.supervisor.open creates or reuses the Project's Supervisor seat agent
   } finally {
     rmSync(paseoHome, { recursive: true, force: true });
     rmSync(repoDir, { recursive: true, force: true });
+  }
+});
+
+test("trial and desktop Paseo homes register factory-burn-lab and render live Free pool, active Projects, and Upstream issue #01 cleanly", async () => {
+  const home = homedir();
+  const homes = [join(home, ".paseo-factory"), join(home, ".paseo")];
+
+  for (const paseoHome of homes) {
+    const configPath = join(paseoHome, "config.json");
+    if (!existsSync(configPath)) continue;
+
+    const config = JSON.parse(readFileSync(configPath, "utf8")) as {
+      plugins?: Record<string, { source?: string; path?: string; enabled?: boolean }>;
+    };
+    assert.ok(config.plugins?.["paseo-factory"], `expected paseo-factory in ${configPath}`);
+    assert.deepEqual(config.plugins?.["factory-burn-lab"], {
+      source: "directory",
+      path: "/Users/andrewpham/Documents/code/self-project/factory-burn-lab/plugin",
+      enabled: true,
+    });
+
+    const handlers = createBurnSurfaceHandlers({ paseoHome });
+    const snap = await handlers.snapshot({});
+    assert.equal(snap.ok, true);
+    if (!snap.ok) continue;
+
+    assert.equal(snap.view.kpis.totalFreeModels >= 10, true);
+    assert.equal(snap.view.kpis.healthyFreeModels >= 1, true);
+    assert.equal(snap.view.kpis.coderModels >= 1, true);
+    assert.equal(snap.view.kpis.reader1mModels >= 1, true);
+    assert.equal(snap.view.kpis.reviewerModels >= 1, true);
+    assert.equal(snap.view.projects.length >= 1, true);
+    assert.ok(snap.view.activeProject);
+    assert.equal(
+      snap.view.projects.some((p) => p.name === "factory-burn-lab"),
+      true,
+    );
+    assert.equal(snap.view.kpis.totalRuns >= 1, true);
+    assert.equal(snap.view.kpis.upstreamIssues >= 1, true);
+    const issue01 = snap.view.upstreamIssues.find((i) => i.number === "01");
+    assert.ok(issue01);
+    assert.equal(issue01.status, "needs-triage");
+    assert.equal(existsSync(join(paseoHome, "factory", "ledger.jsonl")), false);
   }
 });
 

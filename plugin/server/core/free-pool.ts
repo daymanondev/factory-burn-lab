@@ -309,6 +309,11 @@ export function discoverFreePool(options?: {
   return records;
 }
 
+function stripAnsi(text: string): string {
+  // eslint-disable-next-line no-control-regex
+  return text.replace(/\u001b\[[0-9;]*[A-Za-z]/g, "");
+}
+
 function defaultOpenCodeRunner(input: {
   model: string;
   prompt: string;
@@ -321,7 +326,7 @@ function defaultOpenCodeRunner(input: {
   return new Promise((resolvePromise) => {
     const child = spawn(bin, ["run", "--standalone", "-m", input.model, input.prompt], {
       cwd: input.cwd,
-      env: buildExtendedPathEnv(),
+      env: { ...buildExtendedPathEnv(), PWD: input.cwd },
       stdio: ["ignore", "pipe", "pipe"],
     });
 
@@ -346,8 +351,8 @@ function defaultOpenCodeRunner(input: {
       clearTimeout(timer);
       resolvePromise({
         ok: false,
-        stdout,
-        stderr,
+        stdout: stripAnsi(stdout),
+        stderr: stripAnsi(stderr),
         latencyMs: Date.now() - startedAt,
         error: err.message,
       });
@@ -356,31 +361,33 @@ function defaultOpenCodeRunner(input: {
     child.on("close", (code) => {
       clearTimeout(timer);
       const latencyMs = Date.now() - startedAt;
+      const cleanStdout = stripAnsi(stdout).trim();
+      const cleanStderr = stripAnsi(stderr).trim();
       if (timedOut) {
         resolvePromise({
           ok: false,
-          stdout,
-          stderr,
+          stdout: cleanStdout,
+          stderr: cleanStderr,
           latencyMs,
           error: `timeout after ${input.timeoutMs}ms`,
         });
         return;
       }
-      const combined = `${stdout}\n${stderr}`;
-      if (code !== 0 || combined.includes("FreeTierError") || stdout.trim().length === 0) {
+      const combined = `${cleanStdout}\n${cleanStderr}`;
+      if (code !== 0 || combined.includes("FreeTierError") || cleanStdout.length === 0) {
         resolvePromise({
           ok: false,
-          stdout,
-          stderr,
+          stdout: cleanStdout,
+          stderr: cleanStderr,
           latencyMs,
-          error: stderr.trim() || `opencode exited with status ${code ?? 1}`,
+          error: cleanStderr || `opencode exited with status ${code ?? 1}`,
         });
         return;
       }
       resolvePromise({
         ok: true,
-        stdout: stdout.trim(),
-        stderr: stderr.trim(),
+        stdout: cleanStdout,
+        stderr: cleanStderr,
         latencyMs,
       });
     });
@@ -436,6 +443,23 @@ export function assignSwarmRoles(input: {
   return roles;
 }
 
+async function mapWithConcurrency<T, R>(
+  items: T[],
+  concurrency: number,
+  worker: (item: T, index: number) => Promise<R>,
+): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  let nextIndex = 0;
+  const runners = Array.from({ length: Math.min(concurrency, items.length) }, async () => {
+    while (nextIndex < items.length) {
+      const idx = nextIndex++;
+      results[idx] = await worker(items[idx], idx);
+    }
+  });
+  await Promise.all(runners);
+  return results;
+}
+
 export async function scoutFreePool(input: {
   paseoHome: string;
   models?: string[];
@@ -444,6 +468,7 @@ export async function scoutFreePool(input: {
   listOutput?: string;
   cachePath?: string;
   timeoutMs?: number;
+  concurrency?: number;
 }): Promise<FreePoolState> {
   const existingState = loadFreePool(input.paseoHome);
   const existingById = new Map(existingState.models.map((m) => [m.id, m]));
@@ -481,6 +506,15 @@ export async function scoutFreePool(input: {
 
   const fixtureRepoDir = mkdtempSync(join(tmpdir(), "burn-scout-fixture-"));
   try {
+    try {
+      execFileSync("git", ["init"], {
+        cwd: fixtureRepoDir,
+        env: buildExtendedPathEnv(),
+        stdio: "ignore",
+      });
+    } catch {
+      // ignore if git init is unavailable
+    }
     mkdirSync(join(fixtureRepoDir, "src"), { recursive: true });
     writeFileSync(
       join(fixtureRepoDir, "src", "math.ts"),
@@ -498,9 +532,9 @@ export async function scoutFreePool(input: {
     );
 
     const now = new Date().toISOString();
-    const updatedModels: FreeModelRecord[] = [];
+    const concurrency = input.concurrency ?? 5;
 
-    for (const candidate of discovered) {
+    const updatedModels = await mapWithConcurrency(discovered, concurrency, async (candidate) => {
       const prev = existingById.get(candidate.id);
       const baseWins = prev?.wins ?? 0;
       const baseAttempts = prev?.attempts ?? 0;
@@ -527,14 +561,18 @@ export async function scoutFreePool(input: {
       } else {
         const prompt = [
           "You are being benchmarked by factory-burn-lab Scout pool.",
-          "Do not call any tools. Reply with a single line containing:",
-          "FIXED_SUM=6 and the exact citation [src/math.ts:1-3]",
+          "Do not call any tools (do not call read, glob, grep, or bash).",
+          "Given file src/math.ts (lines 1-3):",
+          "1: export function sumPositive(values: number[]): number {",
+          "2:   return values.filter((n) => n > 0).reduce((a, b) => a + b, 0);",
+          "3: }",
+          "Reply immediately with a single line containing: FIXED_SUM=6 and the exact citation [src/math.ts:1-3]",
         ].join(" ");
         const runRes = await runOpenCodeFreeModel({
           model: candidate.id,
           prompt,
           cwd: fixtureRepoDir,
-          timeoutMs: input.timeoutMs ?? 30_000,
+          timeoutMs: input.timeoutMs ?? 20_000,
           runner: input.openCodeRunner,
         });
         healthy = runRes.ok;
@@ -552,7 +590,7 @@ export async function scoutFreePool(input: {
       });
 
       const won = healthy && (gatePassed || citationPassed);
-      updatedModels.push({
+      return {
         ...candidate,
         healthy,
         latencyMs,
@@ -563,8 +601,8 @@ export async function scoutFreePool(input: {
         attempts: baseAttempts + 1,
         lastScoutedAt: now,
         error: errorMsg,
-      });
-    }
+      };
+    });
 
     const nextState: FreePoolState = {
       updatedAt: now,
