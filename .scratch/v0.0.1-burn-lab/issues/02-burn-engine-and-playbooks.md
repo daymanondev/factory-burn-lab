@@ -1,6 +1,6 @@
 # 02 — 3-Tier `Burn run` engine, 5 `Burn playbook`s, and `Upstream issue` writer
 
-Status: ready-for-agent
+Status: done
 Blocked by: 01
 
 ## Scope
@@ -14,3 +14,7 @@ Blocked by: 01
 2. Implement `src/upstream.ts`:
    - Read and file `Upstream issue` markdown files (`Status: needs-triage`) under `/Users/andrewpham/Documents/code/self-project/research-slp/.scratch/burn-lab-upstream/issues/NN-<slug>.md`.
 3. Unit tests in `test/burn-engine.test.ts` and `test/upstream.test.ts`.
+
+## Comments
+
+- Resolved on `feat/v0.0.1-burn-lab` (`e76e88e` + `c39ee3d`): implemented `src/burn-engine.ts`, `src/upstream.ts`, `test/burn-engine.test.ts`, and `test/upstream.test.ts`.

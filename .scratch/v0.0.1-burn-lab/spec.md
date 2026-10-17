@@ -1,6 +1,6 @@
 # Spec — `factory-burn-lab` v0.0.1: Companion UI Plugin, Dynamic OpenCode Free Pool & 5 Burn Playbooks
 
-Status: ready-for-agent
+Status: done
 
 - **Grounded in:** [`CONTEXT.md`](../../CONTEXT.md) · [`ADR 0001`](../../docs/adr/0001-companion-plugin-and-opencode-free-swarm.md) · [`paseo-factory` (`../research-slp`)](../../../research-slp/CONTEXT.md)
 
