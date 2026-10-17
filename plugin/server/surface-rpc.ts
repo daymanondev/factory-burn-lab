@@ -19,11 +19,15 @@ import {
   loadBurnRun,
   parseSupervisorLane,
   resolveBurnProjects,
-  resolveProjectIdentity,
+  resolveFactoryStateDir,
   resolveSupervisorLane,
   runBurnPlaybook,
   type SupervisorRunner,
 } from "./core/burn-engine.ts";
+import {
+  resolveProject,
+  writeProjectRegistration,
+} from "./core/factory-core/index.ts";
 import {
   loadFreePool,
   type OpenCodeRunner,
@@ -220,7 +224,7 @@ function pickActiveProject(
       (p) => p.root === input.projectRoot || input.projectRoot!.startsWith(`${p.root}/`),
     );
     if (byRoot) return byRoot;
-    const identity = resolveProjectIdentity(input.projectRoot);
+    const identity = resolveProject(input.projectRoot);
     if (identity.ok) {
       const byResolved = projects.find(
         (p) => p.slug === identity.slug || p.root === identity.root,
@@ -629,6 +633,12 @@ export function createBurnSurfaceHandlers(deps: BurnSurfaceDeps = {}) {
           );
         }
       }
+
+      writeProjectRegistration(resolveFactoryStateDir(paseoHome), project.slug, {
+        root: project.root,
+        name: project.name,
+        supervisor: agentId,
+      });
 
       const trimmedMessage = input.message?.trim();
       if (trimmedMessage) {

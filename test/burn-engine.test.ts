@@ -7,13 +7,16 @@ import test from "node:test";
 import {
   addBurnProject,
   DEFAULT_SUPERVISOR_LANE,
+  defaultSupervisorRunner,
   listBurnRuns,
   loadBurnRun,
   resolveBurnProjects,
+  resolveFactoryStateDir,
   resolveProjectIdentity,
   resolveSupervisorLane,
   runBurnPlaybook,
 } from "../src/burn-engine.ts";
+import * as factoryCore from "../src/factory-core/index.ts";
 import { loadFreePool, saveFreePool } from "../src/free-pool.ts";
 import { listUpstreamIssues } from "../src/upstream.ts";
 
@@ -38,7 +41,89 @@ function initTempGitRepo(dir: string): void {
   execFileSync("git", ["commit", "-m", "initial commit"], { cwd: dir, stdio: "ignore" });
 }
 
-test("resolveBurnProjects, resolveSupervisorLane, and addBurnProject read paseo-factory projects and lanes without touching factory ledger", () => {
+test("src/factory-core/index.ts exports complete paseo-factory core surface and prepareTaskWorktree supports symlinkNodeModules cleanly", async () => {
+  const requiredExports = [
+    "createFactory",
+    "runGate",
+    "loadLanes",
+    "runLaneCli",
+    "parseLane",
+    "projectLanesPath",
+    "provisionPiAgentHome",
+    "resolveProject",
+    "projectStateDir",
+    "readProjectRegistration",
+    "writeProjectRegistration",
+    "listProjectRegistrations",
+    "discoverProjects",
+    "resolveClaimedCommit",
+    "checkCleanAt",
+    "headCommitSync",
+    "diffBetween",
+    "changedFiles",
+    "changesOutsideScope",
+    "scopeCoversFile",
+    "prepareTaskWorktree",
+    "landTaskWorktree",
+    "MEMORY_FILES",
+    "WATCH_QUESTIONS",
+    "parseEyeAnswer",
+    "MAX_ATTEMPTS",
+  ] as const;
+
+  for (const symbol of requiredExports) {
+    assert.notEqual(
+      (factoryCore as Record<string, unknown>)[symbol],
+      undefined,
+      `Expected src/factory-core/index.ts to export ${symbol}`,
+    );
+  }
+
+  const stateDir = mkdtempSync(join(tmpdir(), "burn-core-state-"));
+  const repoDir = mkdtempSync(join(tmpdir(), "burn-core-repo-"));
+  const customWtDir = join(stateDir, "custom-wt", "attempt-1");
+  try {
+    initTempGitRepo(repoDir);
+    mkdirSync(join(repoDir, "node_modules", "dummy-pkg"), { recursive: true });
+    writeFileSync(join(repoDir, "node_modules", "dummy-pkg", "index.js"), "module.exports = 1;\n", "utf8");
+    writeFileSync(join(repoDir, ".env.local"), "SECRET_KEY=test\n", "utf8");
+    writeFileSync(join(repoDir, ".worktreeinclude"), ".env*\n", "utf8");
+    execFileSync("git", ["add", ".worktreeinclude"], { cwd: repoDir, stdio: "ignore" });
+    execFileSync("git", ["commit", "-m", "add worktreeinclude"], { cwd: repoDir, stdio: "ignore" });
+
+    const baseSha = factoryCore.headCommitSync(repoDir);
+    assert.ok(baseSha);
+
+    const prepared = factoryCore.prepareTaskWorktree({
+      stateDir,
+      workspace: repoDir,
+      task: "attempt-1",
+      base: baseSha,
+      worktreePath: customWtDir,
+      branchName: "burn/test-run/glm-5.3-flash-free",
+      symlinkNodeModules: true,
+    });
+    assert.equal(prepared.ok, true);
+    if (!prepared.ok) return;
+    assert.equal(prepared.path, customWtDir);
+    assert.equal(prepared.branch, "burn/test-run/glm-5.3-flash-free");
+    assert.equal(existsSync(join(customWtDir, ".env.local")), true);
+    assert.equal(existsSync(join(customWtDir, "node_modules", "dummy-pkg", "index.js")), true);
+
+    const clean = await factoryCore.checkCleanAt(customWtDir, baseSha);
+    assert.deepEqual(clean, { ok: true });
+  } finally {
+    try {
+      execFileSync("git", ["worktree", "remove", "--force", customWtDir], { cwd: repoDir, stdio: "ignore" });
+    } catch {
+      // ignore
+    }
+    rmSync(stateDir, { recursive: true, force: true });
+    rmSync(repoDir, { recursive: true, force: true });
+  }
+});
+
+test("resolveBurnProjects, resolveSupervisorLane, addBurnProject, and defaultSupervisorRunner unify with paseo-factory registry and runLaneCli", async () => {
   const paseoHome = mkdtempSync(join(tmpdir(), "burn-engine-home-"));
   const repoDir = mkdtempSync(join(tmpdir(), "burn-sample-repo-"));
   const petDir = join(tmpdir(), `burn-pet-repo-${Date.now()}`);
@@ -48,6 +133,9 @@ test("resolveBurnProjects, resolveSupervisorLane, and addBurnProject read paseo-
     const identity = resolveProjectIdentity(repoDir);
     assert.equal(identity.ok, true);
     if (!identity.ok) return;
+
+    const factoryStateDir = resolveFactoryStateDir(paseoHome);
+    assert.equal(factoryStateDir, join(paseoHome, "plugin-state", "paseo-factory"));
 
     mkdirSync(join(paseoHome, "factory", "projects", identity.slug), { recursive: true });
     writeFileSync(
@@ -71,10 +159,19 @@ test("resolveBurnProjects, resolveSupervisorLane, and addBurnProject read paseo-
     );
     assert.equal(resolveSupervisorLane(paseoHome, identity.slug), "copilot/gpt-5.4");
 
+    // Also verify plugin-state/paseo-factory lanes override via loadLanes
+    mkdirSync(join(factoryStateDir, "projects", identity.slug), { recursive: true });
+    writeFileSync(
+      join(factoryStateDir, "projects", identity.slug, "lanes.json"),
+      JSON.stringify({ supervisor: "pi/zai/glm-5.3:high" }),
+      "utf8",
+    );
+    assert.equal(resolveSupervisorLane(paseoHome, identity.slug), "pi/zai/glm-5.3:high");
+
     const projects = resolveBurnProjects(paseoHome, { includeSelfRepo: false });
     assert.equal(projects.length, 1);
     assert.equal(projects[0]?.slug, identity.slug);
-    assert.equal(projects[0]?.supervisorLane, "copilot/gpt-5.4");
+    assert.equal(projects[0]?.supervisorLane, "pi/zai/glm-5.3:high");
 
     const added = addBurnProject(paseoHome, petDir, { initGit: true, name: "Pet Prototype" });
     assert.equal(added.ok, true);
@@ -82,8 +179,60 @@ test("resolveBurnProjects, resolveSupervisorLane, and addBurnProject read paseo-
     assert.equal(added.project.name, "Pet Prototype");
     assert.equal(existsSync(join(petDir, ".git")), true);
 
+    // Verify addBurnProject wrote directly to <paseoHome>/plugin-state/paseo-factory/projects/<slug>/project.json
+    const sharedProjectJson = join(factoryStateDir, "projects", added.project.slug, "project.json");
+    assert.equal(existsSync(sharedProjectJson), true);
+    const reg = factoryCore.readProjectRegistration(factoryStateDir, added.project.slug);
+    assert.ok(reg);
+    assert.equal(reg.root, added.project.root);
+    assert.equal(reg.name, "Pet Prototype");
+    assert.equal(
+      factoryCore.listProjectRegistrations(factoryStateDir).some((r) => r.slug === added.project.slug),
+      true,
+    );
+    assert.equal(
+      factoryCore.discoverProjects(factoryStateDir, [], paseoHome).some((d) => d.slug === added.project.slug),
+      true,
+    );
+
     const updatedProjects = resolveBurnProjects(paseoHome, { includeSelfRepo: false });
     assert.equal(updatedProjects.length, 2);
+    assert.equal(
+      updatedProjects.find((p) => p.slug === added.project.slug)?.name,
+      "Pet Prototype",
+    );
+
+    // Verify defaultSupervisorRunner invokes runLaneCli with stateDir: factoryStateDir (clean-room PI_CODING_AGENT_DIR + :thinking flags)
+    const laneCalls: Array<{
+      command: string;
+      args: string[];
+      env?: Record<string, string>;
+    }> = [];
+    const supRes = await defaultSupervisorRunner({
+      lane: "pi/zai/glm-5.3:high",
+      phase: "framing",
+      playbook: "proto-arena",
+      project: added.project,
+      prompt: "Frame prototype task",
+      cwd: added.project.root,
+      timeoutMs: 5_000,
+      paseoHome,
+      laneCliRunner: async (call) => {
+        laneCalls.push({ command: call.command, args: call.args, env: call.env });
+        return { code: 0, stdout: '{"goal":"test"}', stderr: "", timedOut: false };
+      },
+    });
+    assert.equal(supRes.ok, true);
+    assert.equal(laneCalls.length, 1);
+    assert.equal(laneCalls[0]?.command, "pi");
+    assert.equal(laneCalls[0]?.args.includes("--thinking"), true);
+    assert.equal(laneCalls[0]?.args.includes("high"), true);
+    assert.equal(
+      laneCalls[0]?.env?.PI_CODING_AGENT_DIR,
+      join(factoryStateDir, "pi-agent", "headless"),
+    );
+    assert.equal(existsSync(join(factoryStateDir, "pi-agent", "headless", "settings.json")), true);
+
     assert.equal(existsSync(join(paseoHome, "factory", "ledger.jsonl")), false);
   } finally {
     rmSync(paseoHome, { recursive: true, force: true });

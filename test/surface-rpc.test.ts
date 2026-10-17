@@ -5,6 +5,12 @@ import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { createBurnSurfaceHandlers } from "../plugin/server/surface-rpc.ts";
+import { resolveFactoryStateDir } from "../src/burn-engine.ts";
+import {
+  discoverProjects,
+  listProjectRegistrations,
+  readProjectRegistration,
+} from "../src/factory-core/index.ts";
 import { saveFreePool } from "../src/free-pool.ts";
 
 function initTempGitRepo(dir: string): void {
@@ -23,7 +29,7 @@ function initTempGitRepo(dir: string): void {
   execFileSync("git", ["commit", "-m", "initial commit"], { cwd: dir, stdio: "ignore" });
 }
 
-test("burn.snapshot and burn.project.add expose projects, Supervisor lane, Free pool KPIs, and isolate state under burn-lab/", async () => {
+test("burn.snapshot and burn.project.add expose projects, Supervisor lane, Free pool KPIs, and register projects in paseo-factory's shared registry", async () => {
   const paseoHome = mkdtempSync(join(tmpdir(), "burn-surface-home-"));
   const petDir = join(tmpdir(), `burn-surface-pet-${Date.now()}`);
   const upstreamDir = mkdtempSync(join(tmpdir(), "burn-surface-upstream-"));
@@ -71,6 +77,24 @@ test("burn.snapshot and burn.project.add expose projects, Supervisor lane, Free 
     if (!added.ok) return;
     assert.equal(added.project.name, "Pet App");
     assert.equal(added.project.supervisorLane, "claude/claude-opus-4-6");
+
+    const factoryStateDir = resolveFactoryStateDir(paseoHome);
+    assert.equal(
+      existsSync(join(factoryStateDir, "projects", added.project.slug, "project.json")),
+      true,
+    );
+    const reg = readProjectRegistration(factoryStateDir, added.project.slug);
+    assert.ok(reg);
+    assert.equal(reg.root, added.project.root);
+    assert.equal(reg.name, "Pet App");
+    assert.equal(
+      listProjectRegistrations(factoryStateDir).some((r) => r.slug === added.project.slug),
+      true,
+    );
+    assert.equal(
+      discoverProjects(factoryStateDir, [], paseoHome).some((d) => d.slug === added.project.slug),
+      true,
+    );
 
     const snap = await handlers.snapshot({ projectSlug: added.project.slug });
     assert.equal(snap.ok, true);
@@ -299,6 +323,10 @@ test("burn.supervisor.open creates or reuses the Project's Supervisor seat agent
     assert.equal(firstOpen.slug, added.project.slug);
     assert.equal(sentMessages.length, 1);
     assert.equal(sentMessages[0]?.text, "Review our latest OSS Lab findings.");
+    assert.equal(
+      readProjectRegistration(resolveFactoryStateDir(paseoHome), added.project.slug)?.supervisor,
+      "agent-sup-1",
+    );
 
     // Second call reuses the existing Supervisor agent without creating a duplicate
     const secondOpen = await handlers.supervisorOpen({

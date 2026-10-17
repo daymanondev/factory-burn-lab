@@ -15,6 +15,19 @@ import {
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { type CitationGateResult, verifyCitations } from "./citation-gate.ts";
 import {
+  discoverProjects,
+  type LaneCliRunner,
+  lanesPath,
+  listProjectRegistrations,
+  loadLanes,
+  parseLane,
+  projectLanesPath,
+  readProjectRegistration,
+  resolveProject,
+  runLaneCli,
+  writeProjectRegistration,
+} from "./factory-core/index.ts";
+import {
   buildExtendedPathEnv,
   extractModelFamily,
   type FreeModelRecord,
@@ -152,6 +165,15 @@ export interface ParsedSupervisorLane {
 
 export function parseSupervisorLane(lane: string): ParsedSupervisorLane {
   const trimmed = lane.trim() || DEFAULT_SUPERVISOR_LANE;
+  const parsed = parseLane(trimmed);
+  if (parsed) {
+    return {
+      provider: parsed.provider,
+      model: parsed.model,
+      providerSpec: `${parsed.provider}/${parsed.model}`,
+      ...(parsed.thinking ? { thinking: parsed.thinking } : {}),
+    };
+  }
   const slashIdx = trimmed.indexOf("/");
   const colonIdx = trimmed.lastIndexOf(":");
   const hasThinking = colonIdx > slashIdx && colonIdx !== -1;
@@ -170,6 +192,8 @@ export type SupervisorRunner = (input: {
   prompt: string;
   cwd: string;
   timeoutMs: number;
+  paseoHome?: string;
+  laneCliRunner?: LaneCliRunner;
 }) =>
   | Promise<{ ok: boolean; stdout: string; stderr?: string; error?: string }>
   | { ok: boolean; stdout: string; stderr?: string; error?: string };
@@ -180,49 +204,34 @@ export type GateRunner = (input: {
   timeoutMs: number;
 }) => Promise<GateRunResult> | GateRunResult;
 
+/**
+ * Resolves the canonical `paseo-factory` state directory (`<paseoHome>/plugin-state/paseo-factory`).
+ */
+export function resolveFactoryStateDir(paseoHome: string): string {
+  return join(paseoHome, "plugin-state", "paseo-factory");
+}
+
+function factoryStateDirs(paseoHome: string): string[] {
+  return [resolveFactoryStateDir(paseoHome), join(paseoHome, "factory")];
+}
+
 export function resolveProjectIdentity(cwd: string): ProjectIdentityResolution {
   if (!existsSync(cwd)) {
     return { ok: false, error: `directory does not exist: ${cwd}` };
   }
-  let stdout: string;
-  try {
-    stdout = execFileSync("git", ["rev-parse", "--show-toplevel", "--git-common-dir"], {
-      cwd,
-      env: buildExtendedPathEnv(),
-      encoding: "utf8",
-      timeout: 10_000,
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-  } catch (err) {
-    const stderr = (err as { stderr?: unknown }).stderr;
-    const msg =
-      typeof stderr === "string" && stderr.trim()
-        ? stderr.trim().split("\n")[0]
-        : err instanceof Error
-          ? err.message
-          : String(err);
-    return { ok: false, error: msg || `not a git repository: ${cwd}` };
+  const resolved = resolveProject(cwd);
+  if (!resolved.ok) {
+    return { ok: false, error: resolved.reason || `not a git repository: ${cwd}` };
   }
-
-  const lines = stdout.trim().split(/\r?\n/);
-  const rootRaw = lines[0]?.trim() ?? "";
-  const commonDirRaw = lines[1]?.trim() ?? "";
-  if (!rootRaw || !commonDirRaw) {
-    return { ok: false, error: `git rev-parse returned incomplete output for ${cwd}` };
-  }
-
-  const root = existsSync(rootRaw) ? realpathSync.native(rootRaw) : resolve(rootRaw);
-  const commonDirAbs = isAbsolute(commonDirRaw) ? commonDirRaw : resolve(cwd, commonDirRaw);
-  let gitCommonDir: string;
-  try {
-    gitCommonDir = realpathSync.native(commonDirAbs);
-  } catch {
-    return { ok: false, error: `git common dir does not exist: ${commonDirAbs}` };
-  }
-
-  const hash = createHash("sha1").update(gitCommonDir).digest("hex").slice(0, 6);
-  const slug = `${basename(root)}-${hash}`;
-  return { ok: true, slug, root, gitCommonDir };
+  const root = existsSync(resolved.root)
+    ? realpathSync.native(resolved.root)
+    : resolve(resolved.root);
+  return {
+    ok: true,
+    slug: resolved.slug,
+    root,
+    gitCommonDir: resolved.gitCommonDir,
+  };
 }
 
 function readSupervisorFromLanesFile(lanesFilePath: string): string | null {
@@ -243,36 +252,44 @@ function readSupervisorFromLanesFile(lanesFilePath: string): string | null {
 }
 
 export function resolveSupervisorLane(paseoHome: string, projectSlug?: string): string {
-  const factoryRoots = [
-    join(paseoHome, "factory"),
-    join(paseoHome, "plugin-state", "paseo-factory"),
-  ];
+  const stateDirs = factoryStateDirs(paseoHome);
 
   if (projectSlug) {
-    for (const factoryRoot of factoryRoots) {
-      const perProjectLanes = readSupervisorFromLanesFile(
-        join(factoryRoot, "projects", projectSlug, "lanes.json"),
-      );
-      if (perProjectLanes) return perProjectLanes;
+    for (const stateDir of stateDirs) {
+      const projLanesFile = projectLanesPath(stateDir, projectSlug);
+      if (existsSync(projLanesFile)) {
+        const loaded = loadLanes(stateDir, projectSlug);
+        if (loaded.ok && readSupervisorFromLanesFile(projLanesFile) !== null) {
+          return loaded.lanes.supervisor;
+        }
+        const rawProj = readSupervisorFromLanesFile(projLanesFile);
+        if (rawProj) return rawProj;
+      }
 
       const perProjectJson = readSupervisorFromLanesFile(
-        join(factoryRoot, "projects", `${projectSlug}.json`),
+        join(stateDir, "projects", `${projectSlug}.json`),
       );
       if (perProjectJson) return perProjectJson;
 
       const perProjectMeta = readSupervisorFromLanesFile(
-        join(factoryRoot, "projects", projectSlug, "project.json"),
+        join(stateDir, "projects", projectSlug, "project.json"),
       );
       if (perProjectMeta) return perProjectMeta;
     }
   }
 
-  for (const factoryRoot of factoryRoots) {
-    const machineSupervisor = readSupervisorFromLanesFile(join(factoryRoot, "lanes.json"));
-    if (machineSupervisor) return machineSupervisor;
+  for (const stateDir of stateDirs) {
+    const machineLanesFile = lanesPath(stateDir);
+    if (existsSync(machineLanesFile)) {
+      const loaded = loadLanes(stateDir, projectSlug);
+      if (loaded.ok) return loaded.lanes.supervisor;
+      const rawMachine = readSupervisorFromLanesFile(machineLanesFile);
+      if (rawMachine) return rawMachine;
+    }
   }
 
-  return DEFAULT_SUPERVISOR_LANE;
+  const fallback = loadLanes(resolveFactoryStateDir(paseoHome), projectSlug);
+  return fallback.ok ? fallback.lanes.supervisor : DEFAULT_SUPERVISOR_LANE;
 }
 
 function burnLabProjectsPath(paseoHome: string): string {
@@ -303,6 +320,7 @@ function parseProjectEntry(
   paseoHome: string,
   source: BurnProject["source"],
   fallbackSlug?: string,
+  allowTempRoot = false,
 ): BurnProject | null {
   if (raw.archivedAt !== undefined && raw.archivedAt !== null) {
     return null;
@@ -317,6 +335,7 @@ function parseProjectEntry(
   if (!rawRoot || !existsSync(rawRoot)) return null;
 
   const isTempHome =
+    allowTempRoot ||
     paseoHome.startsWith("/tmp/") ||
     paseoHome.startsWith("/private/tmp/") ||
     paseoHome.startsWith("/var/folders/");
@@ -371,12 +390,32 @@ export function resolveBurnProjects(
     byRoot.add(proj.root);
   };
 
-  const factoryDirs = [
-    join(paseoHome, "factory", "projects"),
-    join(paseoHome, "plugin-state", "paseo-factory", "projects"),
-  ];
+  for (const stateDir of factoryStateDirs(paseoHome)) {
+    for (const reg of listProjectRegistrations(stateDir)) {
+      register(
+        parseProjectEntry(
+          { slug: reg.slug, root: reg.root, name: reg.name },
+          paseoHome,
+          "paseo-factory",
+          reg.slug,
+        ),
+      );
+    }
 
-  for (const projectsDir of factoryDirs) {
+    for (const disc of discoverProjects(stateDir, [], paseoHome)) {
+      if (!disc.root) continue;
+      const reg = readProjectRegistration(stateDir, disc.slug);
+      register(
+        parseProjectEntry(
+          { slug: disc.slug, root: disc.root, name: reg?.name },
+          paseoHome,
+          reg ? "paseo-factory" : "paseo",
+          disc.slug,
+        ),
+      );
+    }
+
+    const projectsDir = join(stateDir, "projects");
     if (!existsSync(projectsDir)) continue;
     for (const entryName of readdirSync(projectsDir).sort()) {
       const fullPath = join(projectsDir, entryName);
@@ -442,6 +481,8 @@ export function resolveBurnProjects(
           { name: "factory-burn-lab", root: selfRoot },
           paseoHome,
           "burn-lab",
+          undefined,
+          true,
         ),
       );
     }
@@ -528,30 +569,22 @@ export function addBurnProject(
       return { ok: false, error: identity.error };
     }
 
+    const factoryStateDir = resolveFactoryStateDir(paseoHome);
+    const projectName = options?.name?.trim() || basename(identity.root);
+    writeProjectRegistration(factoryStateDir, identity.slug, {
+      root: identity.root,
+      name: projectName,
+    });
+    const reg = readProjectRegistration(factoryStateDir, identity.slug);
+
     const project: BurnProject = {
       slug: identity.slug,
-      name: options?.name?.trim() || basename(identity.root),
+      name: reg?.name || projectName,
       root: identity.root,
       gitCommonDir: identity.gitCommonDir,
       supervisorLane: resolveSupervisorLane(paseoHome, identity.slug),
-      source: "burn-lab",
+      source: "paseo-factory",
     };
-
-    const filePath = burnLabProjectsPath(paseoHome);
-    mkdirSync(dirname(filePath), { recursive: true });
-    let existing: BurnProject[] = [];
-    if (existsSync(filePath)) {
-      try {
-        const parsed = JSON.parse(readFileSync(filePath, "utf8")) as unknown;
-        existing = unwrapProjectListJson(parsed) as unknown as BurnProject[];
-      } catch {
-        existing = [];
-      }
-    }
-
-    const filtered = existing.filter((p) => p.slug !== project.slug && p.root !== project.root);
-    filtered.push(project);
-    writeFileSync(filePath, `${JSON.stringify({ projects: filtered }, null, 2)}\n`, "utf8");
 
     return { ok: true, project };
   } catch (err) {
@@ -676,7 +709,7 @@ function defaultGateRunner(input: {
   });
 }
 
-async function defaultSupervisorRunner(input: {
+export async function defaultSupervisorRunner(input: {
   lane: string;
   phase: "framing" | "synthesizing";
   playbook: BurnPlaybook;
@@ -684,8 +717,11 @@ async function defaultSupervisorRunner(input: {
   prompt: string;
   cwd: string;
   timeoutMs: number;
+  paseoHome?: string;
+  laneCliRunner?: LaneCliRunner;
 }): Promise<{ ok: boolean; stdout: string; stderr?: string; error?: string }> {
-  const { provider, model } = parseSupervisorLane(input.lane);
+  const effectiveLane = input.lane.trim() || DEFAULT_SUPERVISOR_LANE;
+  const { provider, model } = parseSupervisorLane(effectiveLane);
 
   if (provider === "opencode") {
     const res = await runOpenCodeFreeModel({
@@ -705,89 +741,35 @@ async function defaultSupervisorRunner(input: {
     };
   }
 
-  const cliResult = await new Promise<{
-    ok: boolean;
-    stdout: string;
-    stderr: string;
-    error?: string;
-  }>((res) => {
-    let cmd = "pi";
-    let args: string[] = [];
-    if (provider === "pi") {
-      cmd = "pi";
-      args = [
-        "--print",
-        "--no-session",
-        "--no-tools",
-        "--no-extensions",
-        "--no-skills",
-        "--no-context-files",
-        "--model",
-        model,
-      ];
-    } else if (provider === "copilot") {
-      cmd = "copilot";
-      args = ["-s", "--model", model, "--reasoning-effort", "medium"];
-    } else if (provider === "claude") {
-      cmd = "claude";
-      args = ["-p", "--model", model, "--tools", ""];
-    } else {
-      res({
-        ok: false,
-        stdout: "",
-        stderr: `unsupported provider ${provider}`,
-        error: `unsupported provider ${provider}`,
-      });
-      return;
-    }
-
-    const child = spawn(cmd, args, {
-      cwd: input.cwd,
-      env: buildExtendedPathEnv(),
-      stdio: ["pipe", "pipe", "pipe"],
-    });
-
-    let stdout = "";
-    let stderr = "";
-    const timer = setTimeout(() => {
-      child.kill("SIGKILL");
-    }, input.timeoutMs);
-
-    child.stdout?.on("data", (d: Buffer) => {
-      stdout += d.toString("utf8");
-    });
-    child.stderr?.on("data", (d: Buffer) => {
-      stderr += d.toString("utf8");
-    });
-    child.on("error", (err) => {
-      clearTimeout(timer);
-      res({ ok: false, stdout, stderr: err.message, error: err.message });
-    });
-    child.on("close", (code) => {
-      clearTimeout(timer);
-      const cleanStdout = stdout.trim();
-      const cleanStderr = stderr.trim();
-      const ok = code === 0 && cleanStdout.length > 0;
-      res({
-        ok,
-        stdout: cleanStdout,
-        stderr: cleanStderr,
-        error: ok ? undefined : cleanStderr || `${provider} exited with status ${code ?? 1}`,
-      });
-    });
-
-    child.stdin?.write(input.prompt);
-    child.stdin?.end();
+  const factoryStateDir = input.paseoHome
+    ? resolveFactoryStateDir(input.paseoHome)
+    : undefined;
+  const laneRes = await runLaneCli({
+    lane: effectiveLane,
+    stdin: input.prompt,
+    timeoutMs: input.timeoutMs,
+    stateDir: factoryStateDir,
+    runner: input.laneCliRunner,
   });
 
-  if (cliResult.ok) {
-    return { ok: true, stdout: cliResult.stdout, stderr: cliResult.stderr };
+  if (laneRes.ok) {
+    const cleanStdout = laneRes.stdout.trim();
+    if (cleanStdout.length > 0) {
+      return { ok: true, stdout: cleanStdout };
+    }
+    return {
+      ok: false,
+      stdout: "",
+      stderr: `${provider} returned empty output`,
+      error: `${provider} returned empty output`,
+    };
   }
+
   return {
     ok: false,
-    stdout: cliResult.stdout,
-    stderr: cliResult.stderr,
-    error: cliResult.error ?? (cliResult.stderr || "supervisor invocation failed"),
+    stdout: "",
+    stderr: laneRes.error,
+    error: laneRes.error || "supervisor invocation failed",
   };
 }
 
@@ -1267,6 +1249,7 @@ export async function runBurnPlaybook(input: {
       ].join("\n"),
       cwd: project.root,
       timeoutMs,
+      paseoHome: input.paseoHome,
     });
     if (!framingRes.ok) {
       throw new Error(framingRes.error ?? framingRes.stderr ?? "Supervisor framing failed");
@@ -1641,6 +1624,7 @@ export async function runBurnPlaybook(input: {
       ].join("\n"),
       cwd: project.root,
       timeoutMs,
+      paseoHome: input.paseoHome,
     });
     if (!synthesisRes.ok) {
       throw new Error(synthesisRes.error ?? synthesisRes.stderr ?? "Supervisor synthesis failed");
