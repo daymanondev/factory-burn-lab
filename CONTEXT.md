@@ -7,15 +7,15 @@ An autonomous multi-agent burner delivered as a companion Paseo plugin to `paseo
 ### Core and boundaries
 
 **Burn lab**:
-The companion Paseo plugin (`factory-burn-lab`) and its isolated state directory (`<paseoHome>/burn-lab/`) where free-model experiments, benchmarks, open-source harvests, and prototype arenas run. It reads `paseo-factory`'s registered `Project`s and `Lane config` and reuses its verification core, but never writes to `paseo-factory`'s `Ledger`.
+The companion Paseo plugin (`factory-burn-lab`, installed alongside `paseo-factory`) and its isolated state directory (`<paseoHome>/burn-lab/`) where free-model experiments, benchmarks, open-source harvests, and prototype arenas run. It shares `paseo-factory`'s `Project` registry and `Lane config` (`<paseoHome>/plugin-state/paseo-factory/`) and instantiates `paseo-factory`'s verification core (`createFactory`) inside each `Burn run`'s own directory so `paseo-factory`'s production `Ledger` is never touched.
 _Avoid_: burner mode, playground, sandbox
 
 **Project**:
-One Git repository registered in `paseo-factory` (`<project-slug> = <basename>-<sha1(gitRoot).slice(0,6)>`), which serves as the starting context and destination root for a `Burn run` and hosts the project's strong `Supervisor`.
+One Git repository registered in `paseo-factory` (`<project-slug> = <basename>-<sha1(gitCommonDir).slice(0,6)>`), shared across the `Factory surface` and `Burn Lab` via `<factoryStateDir>/projects/<slug>/project.json`, which serves as the starting context and destination root for a `Burn run` and hosts the project's strong `Supervisor`.
 _Avoid_: workspace, folder, target dir
 
 **Supervisor**:
-The Project's existing strong-model seat from `paseo-factory` (`lanes.supervisor`, rooted at `<project-root>`), acting as the anti-hallucination anchor for every `Burn run`: it frames the brief and verification criteria at the start of a run, judges the filtered evidence at the end, and is reached conversationally via `Open Supervisor`.
+The Project's existing strong-model seat from `paseo-factory` (`lanes.supervisor`, rooted at `<project-root>`), acting as the anti-hallucination anchor for every `Burn run`: it frames the brief and `Contract` criteria (`gate`, `artifact`, `scope`) at the start of a run, judges the filtered evidence at the end, and is reached conversationally via `Open Supervisor`.
 _Avoid_: anchor seat, orchestrator, manager, chair
 
 **Upstream issue**:
@@ -33,13 +33,13 @@ One `$0` model entry inside the `Free pool` (invoked through OpenCode's harness 
 _Avoid_: cheap model, worker model, flash model (some free models are preview reasoning or 1M-context models)
 
 **Swarm role**:
-The capability badge assigned to a `Free model` by `Scout pool`: `coder` (writes and fixes code under a `Gate`), `reader-1m` (ingests large repositories or long logs in ≥200K–1M context), or `reviewer` (participates in a `Council` or `Citation gate` cross-check).
+The capability badge assigned to a `Free model` by `Scout pool`: `coder` (writes and fixes code under a `Contract` and `Gate`), `reader-1m` (ingests large repositories or long logs in ≥200K–1M context), or `reviewer` (participates in a `Council` or `Citation gate` cross-check).
 _Avoid_: persona, agent type, lane
 
 ### Verification fences
 
 **Gate**:
-The deterministic shell command or check inherited from `paseo-factory` whose zero exit status and output metrics judge whether a `Free model`'s code or prototype actually works.
+The deterministic check inherited from `paseo-factory`'s core (`runGate` inside `factory.claim`): it verifies clean-tree commit integrity, `scope` and `MEMORY_FILES` boundaries (`AGENTS.md`, `CLAUDE.md`, `CONTEXT.md`), required `artifact` presence, and a zero exit status before any `Free model`'s code attempt can turn green.
 _Avoid_: test step, check
 
 **Citation gate**:
@@ -47,14 +47,18 @@ The mechanical verification pass over research outputs from `Free model`s: every
 _Avoid_: fact check, hallucination filter
 
 **Council**:
-A multi-family cross-examination pass in which two or three `Free model`s from distinct model families independently answer the same brief or critique a diff/report, surfacing agreements and contradictions before the `Supervisor`'s final synthesis.
+A multi-family cross-examination pass in which two or three `Free model`s from distinct model families inspect the `Contract`, the actual `git diff` (`diffBetween`), `Gate` output, and `paseo-factory`'s five `Watch` questions (`destructive-writes`, `test-weakened`, `stuck-loop`, `scope-creep`, `secret-leak`) to challenge or approve an attempt before the `Supervisor`'s final synthesis.
 _Avoid_: debate, committee, voting
 
 ### Playbooks and runs
 
 **Burn run**:
-One end-to-end autonomous execution launched from the `Burn Lab` UI against a selected `Project` using one `Burn playbook`: `Supervisor` framing → parallel `Free pool` execution in isolated worktrees/scratch dirs → `Gate` / `Citation gate` / `Council` filtering → `Supervisor` synthesis into a final deliverable.
+One end-to-end autonomous execution launched from the `Burn Lab` UI against a selected `Project` using one `Burn playbook`: `Supervisor` framing into a `Contract` → parallel `Free pool` execution in isolated worktrees with self-repair rework under a run-scoped `createFactory` instance → `Gate` / `Citation gate` / `Council` filtering → `Supervisor` synthesis into a final report and optional `Winning branch landing`.
 _Avoid_: job, session, task (Task is `paseo-factory`'s unit)
+
+**Winning branch landing**:
+The explicit 1-click Owner act on the `Burn Lab` UI (`burn.land`) that merges a `Burn run`'s verified winning commit (`claimedCommit` on `winningBranch`) back into `<project-root>` using `paseo-factory`'s `landTaskWorktree` (`--ff-only` or `--no-ff`, aborting cleanly on conflict while preserving the branch).
+_Avoid_: auto-merge, force push, checkout overwrite
 
 **Burn playbook**:
 One of the five autonomous workflows selectable on the `Burn Lab` UI: `Scout pool`, `OSS lab`, `Proto arena`, `Night shift`, and `Self-evolve`.

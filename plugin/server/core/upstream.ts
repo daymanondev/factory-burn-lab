@@ -46,6 +46,7 @@ export function resolveDefaultSelfRepoRoot(
 export function resolveDefaultUpstreamIssuesDir(
   selfRepoRoot: string = resolveDefaultSelfRepoRoot(),
   env: NodeJS.ProcessEnv = process.env,
+  home: string = homedir(),
 ): string {
   if (env.BURN_LAB_UPSTREAM_ISSUES_DIR?.trim()) {
     return resolve(env.BURN_LAB_UPSTREAM_ISSUES_DIR.trim());
@@ -53,11 +54,26 @@ export function resolveDefaultUpstreamIssuesDir(
   const parentDir = dirname(resolve(selfRepoRoot));
   const paseoFactorySibling = join(parentDir, "paseo-factory");
   const researchSlpSibling = join(parentDir, "research-slp");
-  const upstreamRepo =
-    existsSync(paseoFactorySibling) && !existsSync(researchSlpSibling)
-      ? paseoFactorySibling
-      : researchSlpSibling;
-  return join(upstreamRepo, ".scratch", "burn-lab-upstream", "issues");
+  if (existsSync(researchSlpSibling)) {
+    return join(researchSlpSibling, ".scratch", "burn-lab-upstream", "issues");
+  }
+  if (existsSync(paseoFactorySibling)) {
+    return join(paseoFactorySibling, ".scratch", "burn-lab-upstream", "issues");
+  }
+  const homeCandidates = [
+    join(home, "Documents", "code", "self-project", "research-slp"),
+    join(home, "Documents", "code", "self-project", "paseo-factory"),
+    join(home, "code", "self-project", "research-slp"),
+    join(home, "code", "self-project", "paseo-factory"),
+    join(home, "Documents", "code", "research-slp"),
+    join(home, "code", "research-slp"),
+  ];
+  for (const candidate of homeCandidates) {
+    if (existsSync(candidate)) {
+      return join(candidate, ".scratch", "burn-lab-upstream", "issues");
+    }
+  }
+  return join(researchSlpSibling, ".scratch", "burn-lab-upstream", "issues");
 }
 
 export const DEFAULT_UPSTREAM_ISSUES_DIR = resolveDefaultUpstreamIssuesDir();

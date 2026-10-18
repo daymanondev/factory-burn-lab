@@ -16,6 +16,7 @@ import { useState } from "react";
 import { Pressable, Text, View } from "react-native";
 import {
   burnDetail,
+  burnLand,
   burnPreflight,
   burnProjectAdd,
   burnScout,
@@ -226,6 +227,7 @@ export function BurnLabShell({
   const scoutCall = useRpc(burnScout);
   const startCall = useRpc(burnStart);
   const detailCall = useRpc(burnDetail);
+  const landCall = useRpc(burnLand);
   const upstreamFileCall = useRpc(burnUpstreamFile);
   const projectAddCall = useRpc(burnProjectAdd);
   const supervisorOpenCall = useRpc(burnSupervisorOpen);
@@ -273,6 +275,26 @@ export function BurnLabShell({
         projectRoot: selectedSlug === undefined ? dir : undefined,
       });
       if (!r.ok) return { ok: false as const, code: r.code, error: r.error };
+      if (detailModal !== null && !detailModal.loading) {
+        const latestSummary = r.view.runs.find((run) => run.id === detailModal.runId);
+        if (
+          latestSummary &&
+          (detailModal.detail === null ||
+            detailModal.detail.run.status !== latestSummary.status ||
+            detailModal.detail.run.updatedAt !== latestSummary.updatedAt ||
+            detailModal.detail.run.attemptCount !== latestSummary.attemptCount)
+        ) {
+          const detailRes = await detailCall({ runId: detailModal.runId });
+          if (detailRes.ok) {
+            setDetailModal({
+              runId: detailModal.runId,
+              loading: false,
+              detail: detailRes.detail,
+              error: null,
+            });
+          }
+        }
+      }
       return { ok: true as const, value: r.view };
     },
     `burn-lab:${selectedSlug ?? dir ?? "default"}:${bump}`,
@@ -379,13 +401,52 @@ export function BurnLabShell({
         projectSlug: activeProject?.slug,
         targetRepo: playbookDraft.targetRepo.trim() || undefined,
         gateCommand: playbookDraft.gateCommand.trim() || undefined,
-        awaitCompletion: true,
+        awaitCompletion: false,
       });
       if (res.ok) {
+        setRunFilter("all");
         setStatusNote(
-          `Burn run ${res.run.id} (${res.run.playbook}) → ${res.run.status} (${res.run.acceptedCount}/${res.run.attemptCount} verified)`,
+          `Burn run ${res.run.id} (${res.run.playbook}) → ${res.run.status} (streaming live phases…)`,
         );
-        openRunDetail(res.run.id);
+      }
+      return res;
+    });
+  };
+
+  const handleLandWinningBranch = (runId: string) => {
+    setStatusNote(`Landing winning branch for ${runId}…`);
+    void runAction("Land Winning Branch", async () => {
+      const res = await landCall({ runId });
+      if (res.ok) {
+        setStatusNote(res.summary);
+        openRunDetail(runId);
+      }
+      return res;
+    });
+  };
+
+  const handleSendRunToSupervisor = (detail: BurnRunDetailView) => {
+    const summaryText = [
+      `Burn Run ${detail.run.id} (${detail.run.playbook}) finished with status: ${detail.run.status} (${detail.run.acceptedCount}/${detail.run.attemptCount} verified attempts).`,
+      ...(detail.run.winningBranch
+        ? [
+            `Winning Branch: ${detail.run.winningBranch} (commit: ${detail.run.winningCommit ?? "n/a"}, landing: ${detail.run.landingStatus ?? "not_landed"})`,
+          ]
+        : []),
+      ...(detail.reportMarkdown ? ["", detail.reportMarkdown] : []),
+    ].join("\n");
+
+    void runAction("Send to Supervisor", async () => {
+      const res = await supervisorOpenCall({
+        projectSlug: detail.run.projectSlug,
+        projectRoot: detail.run.projectRoot,
+        message: summaryText,
+      });
+      if (res.ok) {
+        navigation?.openAgent({ agentId: res.agentId, serverId });
+        setStatusNote(
+          `Sent Burn Run ${detail.run.id} report to Supervisor (${res.supervisorLane})`,
+        );
       }
       return res;
     });
@@ -1020,7 +1081,13 @@ export function BurnLabShell({
           ) : detailModal.error !== null ? (
             <Text style={text(theme, "label", "statusWarning")}>{detailModal.error}</Text>
           ) : detailModal.detail === null ? null : (
-            <BurnRunDetailBody theme={theme} detail={detailModal.detail} />
+            <BurnRunDetailBody
+              theme={theme}
+              detail={detailModal.detail}
+              busy={busy}
+              onLandWinningBranch={() => handleLandWinningBranch(detailModal.detail!.run.id)}
+              onSendToSupervisor={() => handleSendRunToSupervisor(detailModal.detail!)}
+            />
           )}
           <View style={{ paddingTop: SPACING[2] }}>
             <Btn
@@ -1358,6 +1425,23 @@ function BurnRunRow({
         <Pill theme={theme} label={`Council Checks: ${run.councilCount}`} />
         {run.winningModel !== null ? (
           <Pill theme={theme} label={`Winner: ${run.winningModel}`} tone="statusSuccess" lit mono />
+        ) : null}
+        {run.winningBranch !== null ? (
+          <Pill theme={theme} label={`Branch: ${run.winningBranch}`} tone="accent" lit mono />
+        ) : null}
+        {run.landingStatus !== null ? (
+          <Pill
+            theme={theme}
+            label={`Landing: ${run.landingStatus}`}
+            tone={
+              run.landingStatus === "landed"
+                ? "statusSuccess"
+                : run.landingStatus === "pending-conflict"
+                  ? "statusWarning"
+                  : "foregroundMuted"
+            }
+            lit={run.landingStatus !== "not_landed"}
+          />
         ) : null}
         {run.gateCommand !== null ? (
           <Pill theme={theme} label={`Gate: ${run.gateCommand}`} mono />
@@ -1724,14 +1808,20 @@ function UpstreamIssuesPane({
 function BurnRunDetailBody({
   theme,
   detail,
+  busy = false,
+  onLandWinningBranch,
+  onSendToSupervisor,
 }: {
   theme: PluginTheme;
   detail: BurnRunDetailView;
+  busy?: boolean;
+  onLandWinningBranch?: () => void;
+  onSendToSupervisor?: () => void;
 }) {
   return (
     <View style={{ gap: SPACING[3] }}>
       {/* Run Overview & Status Pipeline */}
-      <View style={{ gap: SPACING[1] }}>
+      <View style={{ gap: SPACING[1.5] }}>
         <View style={{ flexDirection: "row", flexWrap: "wrap", gap: SPACING[1.5] }}>
           <Pill theme={theme} label={detail.run.playbook} tone="accent" lit />
           <Pill
@@ -1741,10 +1831,71 @@ function BurnRunDetailBody({
             lit
           />
           <Pill theme={theme} label={`Supervisor: ${detail.run.supervisorLane}`} mono />
+          {detail.run.winningBranch !== null ? (
+            <Pill theme={theme} label={`Branch: ${detail.run.winningBranch}`} tone="accent" lit mono />
+          ) : null}
+          {detail.run.winningCommit !== null ? (
+            <Pill theme={theme} label={`Commit: ${detail.run.winningCommit.slice(0, 7)}`} mono />
+          ) : null}
+          {detail.run.landingStatus !== null ? (
+            <Pill
+              theme={theme}
+              label={`Landing: ${detail.run.landingStatus}`}
+              tone={
+                detail.run.landingStatus === "landed"
+                  ? "statusSuccess"
+                  : detail.run.landingStatus === "pending-conflict"
+                    ? "statusWarning"
+                    : "foregroundMuted"
+              }
+              lit={detail.run.landingStatus !== "not_landed"}
+            />
+          ) : null}
         </View>
         <Text style={text(theme, "code")}>
           Pipeline: {detail.statusHistory.join(" → ")}
         </Text>
+        {detail.run.landingNote !== null ? (
+          <Text
+            style={text(
+              theme,
+              "meta",
+              detail.run.landingStatus === "pending-conflict" ? "statusWarning" : "foregroundMuted",
+            )}
+          >
+            {detail.run.landingNote}
+          </Text>
+        ) : null}
+
+        <View style={{ flexDirection: "row", flexWrap: "wrap", gap: SPACING[1.5], paddingTop: SPACING[1] }}>
+          {detail.run.winningBranch !== null && onLandWinningBranch ? (
+            <Btn
+              theme={theme}
+              small
+              solid={detail.run.landingStatus !== "landed"}
+              icon="GitMerge"
+              label={
+                detail.run.landingStatus === "landed"
+                  ? "Winning Branch Landed"
+                  : "Land Winning Branch"
+              }
+              tone={detail.run.landingStatus === "landed" ? "statusSuccess" : "accent"}
+              disabled={busy || detail.run.landingStatus === "landed"}
+              onPress={onLandWinningBranch}
+            />
+          ) : null}
+          {onSendToSupervisor ? (
+            <Btn
+              theme={theme}
+              small
+              icon="Shield"
+              label="Send to Supervisor"
+              tone="accent"
+              disabled={busy}
+              onPress={onSendToSupervisor}
+            />
+          ) : null}
+        </View>
       </View>
 
       {/* Tier 1: Supervisor Framing */}
@@ -1760,6 +1911,12 @@ function BurnRunDetailBody({
           <Text style={text(theme, "section")}>Tier 1 — Strong Supervisor Framing</Text>
           <Text style={text(theme, "rowTitle")}>{detail.framing.goal}</Text>
           <Text style={text(theme, "code")}>Gate: {detail.framing.gateCommand}</Text>
+          {detail.framing.artifact ? (
+            <Text style={text(theme, "code")}>Artifact: {detail.framing.artifact}</Text>
+          ) : null}
+          {detail.framing.scope && detail.framing.scope.length > 0 ? (
+            <Text style={text(theme, "code")}>Scope: {detail.framing.scope.join(", ")}</Text>
+          ) : null}
           <Text style={text(theme, "code")}>
             Citation Gate Required: {detail.framing.citationRequired ? "yes" : "no"}
           </Text>
@@ -1804,7 +1961,16 @@ function BurnRunDetailBody({
               />
               <Pill theme={theme} label={att.model} mono />
               <Pill theme={theme} label={`family: ${att.family}`} />
+              <Pill theme={theme} label={`Tries: ${att.attemptCount}`} mono />
               <Pill theme={theme} label={`${att.latencyMs}ms`} mono />
+              {att.factoryVerdict !== null ? (
+                <Pill
+                  theme={theme}
+                  label={`Factory: ${att.factoryVerdict.toUpperCase()}`}
+                  tone={att.factoryVerdict === "green" ? "statusSuccess" : "statusDanger"}
+                  lit
+                />
+              ) : null}
               {att.gatePassed !== null ? (
                 <Pill
                   theme={theme}
@@ -1821,6 +1987,7 @@ function BurnRunDetailBody({
                   lit
                 />
               ) : null}
+              <Pill theme={theme} label={`Changed files: ${att.changedFiles.length}`} mono />
             </View>
             {att.rejectionReason !== null ? (
               <Text style={text(theme, "label", "statusWarning")}>
@@ -1828,6 +1995,17 @@ function BurnRunDetailBody({
               </Text>
             ) : null}
             <Text style={text(theme, "code")}>{att.output}</Text>
+            {att.diffPatch !== null && att.diffPatch.trim() !== "" ? (
+              <View
+                style={{
+                  padding: SPACING[1.5],
+                  borderRadius: RADIUS.sm,
+                  backgroundColor: theme.colors.surface0,
+                }}
+              >
+                <Text style={text(theme, "code")}>{att.diffPatch.slice(0, 1200)}</Text>
+              </View>
+            ) : null}
           </View>
         ))}
       </View>

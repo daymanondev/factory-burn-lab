@@ -11,19 +11,25 @@ import { join } from "node:path";
 import type { PluginServerContext } from "@getpaseo/plugin/server";
 import {
   addBurnProject,
+  allocateBurnRunRecord,
   type BurnPlaybook,
   type BurnProject,
   type BurnRunRecord,
   type GateRunner,
+  landBurnRunWinningBranch,
   listBurnRuns,
   loadBurnRun,
   parseSupervisorLane,
   resolveBurnProjects,
-  resolveProjectIdentity,
+  resolveFactoryStateDir,
   resolveSupervisorLane,
   runBurnPlaybook,
   type SupervisorRunner,
 } from "./core/burn-engine.ts";
+import {
+  resolveProject,
+  writeProjectRegistration,
+} from "./core/factory-core/index.ts";
 import {
   loadFreePool,
   type OpenCodeRunner,
@@ -43,6 +49,7 @@ import {
 } from "./core/upstream.ts";
 import {
   burnDetail,
+  burnLand,
   burnPreflight,
   burnProjectAdd,
   burnScout,
@@ -161,6 +168,10 @@ function summarizeRun(run: BurnRunRecord): BurnRunSummaryView {
     acceptedCount: run.attempts.filter((a) => a.accepted).length,
     councilCount: run.councilNotes.length,
     winningModel: run.winningModel ?? null,
+    winningBranch: run.winningBranch ?? null,
+    winningCommit: run.winningCommit ?? null,
+    landingStatus: run.landingStatus ?? null,
+    landingNote: run.landingNote ?? null,
     hasReport: Boolean(run.reportMarkdown || run.reportPath),
     error: run.error ?? null,
   };
@@ -174,10 +185,14 @@ function toDetailView(run: BurnRunRecord): BurnRunDetailView {
     role: a.role,
     subtask: a.subtask,
     ok: a.ok,
+    attemptCount: a.attemptCount ?? 1,
     latencyMs: a.latencyMs,
     output: a.output,
     accepted: a.accepted,
     rejectionReason: a.rejectionReason ?? null,
+    factoryVerdict: a.factoryVerdict ?? null,
+    changedFiles: a.changedFiles ?? [],
+    diffPatch: a.diffPatch ?? null,
     gatePassed: a.gateResult ? a.gateResult.ok : null,
     gateExitCode: a.gateResult ? a.gateResult.exitCode : null,
     gateCommand: a.gateResult ? a.gateResult.command : null,
@@ -196,6 +211,8 @@ function toDetailView(run: BurnRunRecord): BurnRunDetailView {
           goal: run.framing.goal,
           subtasks: run.framing.subtasks,
           gateCommand: run.framing.gateCommand,
+          ...(run.framing.artifact ? { artifact: run.framing.artifact } : {}),
+          ...(run.framing.scope ? { scope: run.framing.scope } : {}),
           citationRequired: run.framing.citationRequired,
         }
       : null,
@@ -220,7 +237,7 @@ function pickActiveProject(
       (p) => p.root === input.projectRoot || input.projectRoot!.startsWith(`${p.root}/`),
     );
     if (byRoot) return byRoot;
-    const identity = resolveProjectIdentity(input.projectRoot);
+    const identity = resolveProject(input.projectRoot);
     if (identity.ok) {
       const byResolved = projects.find(
         (p) => p.slug === identity.slug || p.root === identity.root,
@@ -472,8 +489,18 @@ export function createBurnSurfaceHandlers(deps: BurnSurfaceDeps = {}) {
       }
 
       try {
+        const initialRun = allocateBurnRunRecord({
+          paseoHome,
+          playbook: input.playbook,
+          prompt: trimmedPrompt,
+          projectSlug: input.projectSlug,
+          targetRepo: input.targetRepo,
+          gateCommand: input.gateCommand,
+        });
+
         const burnRunPromise = runBurnPlaybook({
           paseoHome,
+          runId: initialRun.id,
           playbook: input.playbook,
           prompt: trimmedPrompt,
           projectSlug: input.projectSlug,
@@ -497,10 +524,7 @@ export function createBurnSurfaceHandlers(deps: BurnSurfaceDeps = {}) {
 
         if (input.awaitCompletion === false) {
           void burnRunPromise.catch(() => {});
-          const latest = listBurnRuns(paseoHome)[0];
-          if (latest) {
-            return { ok: true as const, run: summarizeRun(latest) };
-          }
+          return { ok: true as const, run: summarizeRun(initialRun) };
         }
 
         const completedRun = await burnRunPromise;
@@ -528,6 +552,24 @@ export function createBurnSurfaceHandlers(deps: BurnSurfaceDeps = {}) {
         ok: true as const,
         detail: toDetailView(run),
       };
+    },
+
+    async land(
+      input: { runId: string },
+      _context?: BurnCallContext,
+    ) {
+      try {
+        const res = await landBurnRunWinningBranch(paseoHome, input.runId);
+        if (!res.ok) {
+          return failure(res.code, res.error);
+        }
+        return res;
+      } catch (err) {
+        return failure(
+          "burn-land-failed",
+          err instanceof Error ? err.message : String(err),
+        );
+      }
     },
 
     async upstreamFile(
@@ -630,6 +672,11 @@ export function createBurnSurfaceHandlers(deps: BurnSurfaceDeps = {}) {
         }
       }
 
+      writeProjectRegistration(resolveFactoryStateDir(paseoHome), project.slug, {
+        root: project.root,
+        supervisor: agentId,
+      });
+
       const trimmedMessage = input.message?.trim();
       if (trimmedMessage) {
         try {
@@ -674,6 +721,9 @@ export function registerBurnSurfaceRpc(
   );
   server.handle(burnDetail, (input, context) =>
     handlers.detail(input, { paseo: context.paseo }),
+  );
+  server.handle(burnLand, (input, context) =>
+    handlers.land(input, { paseo: context.paseo }),
   );
   server.handle(burnUpstreamFile, (input, context) =>
     handlers.upstreamFile(input, { paseo: context.paseo }),
