@@ -4,7 +4,10 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { createBurnSurfaceHandlers } from "../plugin/server/surface-rpc.ts";
+import {
+  createBurnSurfaceHandlers,
+  resolvePaseoHome,
+} from "../plugin/server/surface-rpc.ts";
 import { resolveFactoryStateDir } from "../src/burn-engine.ts";
 import {
   discoverProjects,
@@ -299,6 +302,12 @@ test("burn.supervisor.open creates or reuses the Project's Supervisor seat agent
           };
         },
       },
+      providers: {
+        async listModels(provider: string) {
+          assert.equal(provider, "opencode");
+          return { models: [] };
+        },
+      },
     };
 
     const handlers = createBurnSurfaceHandlers({
@@ -419,7 +428,7 @@ test("burn.preflight runs warmup and open-settings, and burn.start fails fast if
   }
 });
 
-test("createBurnSurfaceHandlers defaults to trial home ~/.paseo-factory when present and renders live state cleanly", async () => {
+test("createBurnSurfaceHandlers renders live trial-home state cleanly under an explicit paseo home (resolvePaseoHome now defaults to ~/.paseo)", async () => {
   const trialHome = join(homedir(), ".paseo-factory");
   const configPath = join(trialHome, "config.json");
   if (!existsSync(configPath)) return;
@@ -430,7 +439,9 @@ test("createBurnSurfaceHandlers defaults to trial home ~/.paseo-factory when pre
   assert.ok(config.plugins?.["paseo-factory"], `expected paseo-factory in ${configPath}`);
   assert.equal(config.plugins?.["factory-burn-lab"]?.enabled, true);
 
-  const handlers = createBurnSurfaceHandlers({});
+  // resolvePaseoHome no longer prefers ~/.paseo-factory when PASEO_HOME is unset —
+  // an explicit paseoHome (the PASEO_HOME-equivalent seam) is how the trial home is targeted.
+  const handlers = createBurnSurfaceHandlers({ paseoHome: trialHome });
   const snap = await handlers.snapshot({});
   assert.equal(snap.ok, true);
   if (!snap.ok) return;
@@ -650,6 +661,125 @@ test("burn.start (awaitCompletion: false), burn.detail, and burn.land pre-alloca
     rmSync(paseoHome, { recursive: true, force: true });
     rmSync(repoDir, { recursive: true, force: true });
     rmSync(upstreamDir, { recursive: true, force: true });
+  }
+});
+
+test("resolvePaseoHome defaults to ~/.paseo even when ~/.paseo-factory exists, honors explicit PASEO_HOME, and expands ~", () => {
+  const homeDir = mkdtempSync(join(tmpdir(), "burn-resolve-home-"));
+  try {
+    // A leftover trial home must no longer capture the unset-PASEO_HOME default.
+    mkdirSync(join(homeDir, ".paseo-factory"), { recursive: true });
+    assert.equal(existsSync(join(homeDir, ".paseo-factory")), true);
+
+    assert.equal(resolvePaseoHome({}, homeDir), join(homeDir, ".paseo"));
+    assert.equal(resolvePaseoHome({ PASEO_HOME: "" }, homeDir), join(homeDir, ".paseo"));
+    assert.equal(resolvePaseoHome({ PASEO_HOME: "   " }, homeDir), join(homeDir, ".paseo"));
+
+    // Explicit PASEO_HOME wins (trimmed), with ~-expansion preserved.
+    assert.equal(resolvePaseoHome({ PASEO_HOME: "/custom/paseo " }, homeDir), "/custom/paseo");
+    assert.equal(resolvePaseoHome({ PASEO_HOME: "~" }, homeDir), homeDir);
+    assert.equal(resolvePaseoHome({ PASEO_HOME: "~/paseo-trial" }, homeDir), join(homeDir, "paseo-trial"));
+  } finally {
+    rmSync(homeDir, { recursive: true, force: true });
+  }
+});
+
+test("discoverDaemonFreeModels speaks only providers.listModels(\"opencode\") with single-flight dedup, a 5-minute TTL cache, and scout-driven refresh", async () => {
+  const paseoHome = mkdtempSync(join(tmpdir(), "burn-discover-home-"));
+
+  try {
+    let listModelsCalls = 0;
+    let gate: Promise<void> | null = null;
+    let openGate: (() => void) | null = null;
+    let clockNow = 1_000_000;
+
+    const daemon = {
+      agents: {
+        async list() {
+          return { entries: [] };
+        },
+        async create() {
+          throw new Error("discovery must never open an agent session");
+        },
+        ref(id: string) {
+          return {
+            async send() {
+              throw new Error("discovery must never send to an agent");
+            },
+          };
+        },
+      },
+      providers: {
+        async listModels(provider: string) {
+          assert.equal(provider, "opencode");
+          listModelsCalls += 1;
+          if (gate) await gate;
+          return {
+            models: [
+              { id: "opencode/glm-5.3-flash-free", label: "GLM 5.3 Flash Free" },
+              { id: "opencode/deepseek-v4.1-flash-free", label: "DeepSeek V4.1 Flash Free" },
+            ],
+          };
+        },
+      },
+    };
+
+    const handlers = createBurnSurfaceHandlers({
+      paseoHome,
+      includeSelfRepo: false,
+      daemon,
+      now: () => clockNow,
+      listOutput: ["opencode/glm-5.3-flash-free", "opencode/deepseek-v4.1-flash-free"].join("\n"),
+      scoutProbeRunner: async () => ({
+        healthy: true,
+        latencyMs: 120,
+        codeOutput: "ok",
+        citationOutput: "Cited [src/index.ts:1].",
+      }),
+    });
+
+    // (1) Concurrent callers share one in-flight discovery — a single listModels call.
+    gate = new Promise<void>((resolve) => {
+      openGate = resolve;
+    });
+    const first = handlers.discoverDaemonFreeModels();
+    const second = handlers.discoverDaemonFreeModels();
+    assert.equal(listModelsCalls, 1);
+    openGate!();
+    const [a, b] = await Promise.all([first, second]);
+    assert.ok(a);
+    assert.ok(b);
+    assert.deepEqual(b, a);
+    assert.equal(a.provider, "opencode");
+    assert.equal(typeof a.discoveredAt, "string");
+    assert.deepEqual(
+      a.models.map((m) => m.id),
+      ["opencode/glm-5.3-flash-free", "opencode/deepseek-v4.1-flash-free"],
+    );
+    assert.equal(listModelsCalls, 1);
+
+    // (2) Within the 5-minute TTL, direct calls and burn.snapshot status polls hit the cache.
+    const cached = await handlers.discoverDaemonFreeModels();
+    assert.equal(cached?.models.length, 2);
+    await handlers.snapshot({});
+    await handlers.snapshot({});
+    assert.equal(listModelsCalls, 1);
+
+    // (3) Once the TTL expires, the next call re-flies.
+    clockNow += 5 * 60_000 + 1;
+    gate = null;
+    openGate = null;
+    const refreshed = await handlers.discoverDaemonFreeModels();
+    assert.equal(refreshed?.models.length, 2);
+    assert.equal(listModelsCalls, 2);
+
+    // (4) An explicit scout refresh invalidates the cache — the next status poll re-flies.
+    const scoutRes = await handlers.scout({});
+    assert.equal(scoutRes.ok, true);
+    await handlers.snapshot({});
+    assert.equal(listModelsCalls, 3);
+  } finally {
+    rmSync(paseoHome, { recursive: true, force: true });
   }
 });
 
