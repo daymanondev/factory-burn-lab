@@ -96,6 +96,27 @@ export interface BurnDaemonApi {
       send(text: string): Promise<void>;
     };
   };
+  providers: {
+    listModels(provider: string): Promise<{
+      models: {
+        id: string;
+        label?: string | null;
+        thinkingOptions?: { id: string; label?: string | null }[] | null;
+        defaultThinkingOptionId?: string | null;
+      }[];
+    }>;
+  };
+}
+
+/**
+ * One daemon-side free-model discovery — the zero-side-effect
+ * `provider.models.list.request { provider: "opencode" }` read (never
+ * `agent.session_open.request`), so polling never opens a daemon session.
+ */
+export interface DaemonFreeModelsDiscovery {
+  provider: "opencode";
+  models: { id: string; label: string | null }[];
+  discoveredAt: string;
 }
 
 export interface BurnCallContext {
@@ -120,6 +141,8 @@ export interface BurnSurfaceDeps {
   settingsOpener?: () => { ok: boolean; opened: string[]; error?: string };
   listOutput?: string;
   cachePath?: string;
+  /** Discovery-cache clock override (tests); `Date.now` by default. */
+  now?: () => number;
   onLog?: (message: string) => void;
 }
 
@@ -279,6 +302,56 @@ export function createBurnSurfaceHandlers(deps: BurnSurfaceDeps = {}) {
     error,
   });
 
+  /**
+   * Daemon-side free-model discovery cache — `5 * 60_000 ms` TTL plus
+   * single-flight promise deduplication (the pattern paseo-factory's
+   * `refreshProviders`/`inFlightProviders` established), so `burn.snapshot`
+   * status polls refresh the daemon-side pool through the cache without ever
+   * triggering a daemon session open (spec v0.0.20 §Implementation Decisions 1).
+   */
+  const FREE_MODELS_TTL_MS = 5 * 60_000;
+  const now = deps.now ?? Date.now;
+  let cachedFreeModels: DaemonFreeModelsDiscovery | null = null;
+  let cachedFreeModelsAt = 0;
+  let inFlightFreeModels: Promise<DaemonFreeModelsDiscovery> | null = null;
+
+  const refreshDaemonFreeModels = (
+    daemon: BurnDaemonApi,
+  ): Promise<DaemonFreeModelsDiscovery> => {
+    if (inFlightFreeModels !== null) return inFlightFreeModels;
+    const job = (async () => {
+      const listed = await daemon.providers.listModels("opencode");
+      const discovery: DaemonFreeModelsDiscovery = {
+        provider: "opencode",
+        models: listed.models.map((m) => ({ id: m.id, label: m.label ?? null })),
+        discoveredAt: new Date().toISOString(),
+      };
+      cachedFreeModels = discovery;
+      cachedFreeModelsAt = now();
+      return discovery;
+    })().finally(() => {
+      if (inFlightFreeModels === job) inFlightFreeModels = null;
+    });
+    inFlightFreeModels = job;
+    return job;
+  };
+
+  const discoverDaemonFreeModels = async (
+    context?: BurnCallContext,
+  ): Promise<DaemonFreeModelsDiscovery | null> => {
+    const daemon = resolveDaemon(context);
+    if (daemon === undefined) return null;
+    if (cachedFreeModels !== null && now() - cachedFreeModelsAt < FREE_MODELS_TTL_MS) {
+      return cachedFreeModels;
+    }
+    return refreshDaemonFreeModels(daemon);
+  };
+
+  const invalidateDaemonFreeModels = (): void => {
+    cachedFreeModels = null;
+    cachedFreeModelsAt = 0;
+  };
+
   return {
     async snapshot(
       input: { projectSlug?: string; projectRoot?: string } = {},
@@ -314,6 +387,19 @@ export function createBurnSurfaceHandlers(deps: BurnSurfaceDeps = {}) {
           }
         } catch (err) {
           daemonError = err instanceof Error ? err.message : String(err);
+        }
+      }
+
+      // The status poll refreshes the daemon-side pool through the discovery
+      // cache (TTL + single-flight); the view itself keeps riding the on-disk
+      // pool below, and a discovery failure must never fail the poll.
+      if (daemon) {
+        try {
+          await discoverDaemonFreeModels(context);
+        } catch (err) {
+          deps.onLog?.(
+            `free-models discovery failed: ${err instanceof Error ? err.message : String(err)}`,
+          );
         }
       }
 
@@ -471,6 +557,9 @@ export function createBurnSurfaceHandlers(deps: BurnSurfaceDeps = {}) {
           listOutput: deps.listOutput,
           cachePath: deps.cachePath,
         });
+        // An explicit scout refresh invalidates the daemon-side discovery
+        // cache so the next status poll re-flies (spec §Implementation Decisions 1).
+        invalidateDaemonFreeModels();
         const healthyModels = pool.models.filter((m) => m.healthy).length;
         return {
           ok: true as const,
@@ -713,6 +802,15 @@ export function createBurnSurfaceHandlers(deps: BurnSurfaceDeps = {}) {
         supervisorLane,
       };
     },
+
+    /**
+     * The daemon-side free-model discovery seam — reads the daemon's opencode
+     * model list through `providers.listModels("opencode")` via the in-process
+     * PaseoApi (`context.paseo`) or the wired daemon, behind the TTL +
+     * single-flight cache. Not a registered RPC: `burn.snapshot` polls through
+     * it, and `burn.scout` invalidates it.
+     */
+    discoverDaemonFreeModels,
   };
 }
 
