@@ -5,7 +5,6 @@
  * and Factory Upstream Issues, while maintaining zero contamination of
  * `paseo-factory`'s ledger.
  */
-import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { PluginServerContext } from "@getpaseo/plugin/server";
@@ -128,10 +127,12 @@ export function resolvePaseoHome(
   env: NodeJS.ProcessEnv = process.env,
   homeDir: string = homedir(),
 ): string {
-  const trialHome = join(homeDir, ".paseo-factory");
-  const defaultHome = existsSync(trialHome) ? trialHome : join(homeDir, ".paseo");
+  // The unset/blank default is unconditionally ~/.paseo (Paseo Desktop production),
+  // matching paseo-factory's own resolvePaseoHome law — a leftover ~/.paseo-factory
+  // trial home on the machine must never capture a production plugin host
+  // (spec v0.0.20 §Implementation Decisions 1, §User Story 2).
   const raw =
-    env.PASEO_HOME && env.PASEO_HOME.trim() !== "" ? env.PASEO_HOME.trim() : defaultHome;
+    env.PASEO_HOME && env.PASEO_HOME.trim() !== "" ? env.PASEO_HOME.trim() : join(homeDir, ".paseo");
   if (raw === "~") return homeDir;
   if (raw.startsWith("~/")) return join(homeDir, raw.slice(2));
   return raw;

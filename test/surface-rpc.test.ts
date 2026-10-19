@@ -4,7 +4,10 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { createBurnSurfaceHandlers } from "../plugin/server/surface-rpc.ts";
+import {
+  createBurnSurfaceHandlers,
+  resolvePaseoHome,
+} from "../plugin/server/surface-rpc.ts";
 import { resolveFactoryStateDir } from "../src/burn-engine.ts";
 import {
   discoverProjects,
@@ -419,7 +422,7 @@ test("burn.preflight runs warmup and open-settings, and burn.start fails fast if
   }
 });
 
-test("createBurnSurfaceHandlers defaults to trial home ~/.paseo-factory when present and renders live state cleanly", async () => {
+test("createBurnSurfaceHandlers renders live trial-home state cleanly under an explicit paseo home (resolvePaseoHome now defaults to ~/.paseo)", async () => {
   const trialHome = join(homedir(), ".paseo-factory");
   const configPath = join(trialHome, "config.json");
   if (!existsSync(configPath)) return;
@@ -430,7 +433,9 @@ test("createBurnSurfaceHandlers defaults to trial home ~/.paseo-factory when pre
   assert.ok(config.plugins?.["paseo-factory"], `expected paseo-factory in ${configPath}`);
   assert.equal(config.plugins?.["factory-burn-lab"]?.enabled, true);
 
-  const handlers = createBurnSurfaceHandlers({});
+  // resolvePaseoHome no longer prefers ~/.paseo-factory when PASEO_HOME is unset —
+  // an explicit paseoHome (the PASEO_HOME-equivalent seam) is how the trial home is targeted.
+  const handlers = createBurnSurfaceHandlers({ paseoHome: trialHome });
   const snap = await handlers.snapshot({});
   assert.equal(snap.ok, true);
   if (!snap.ok) return;
@@ -656,3 +661,23 @@ test("burn.start (awaitCompletion: false), burn.detail, and burn.land pre-alloca
 
 
 
+
+test("resolvePaseoHome defaults to ~/.paseo even when ~/.paseo-factory exists, honors explicit PASEO_HOME, and expands ~", () => {
+  const homeDir = mkdtempSync(join(tmpdir(), "burn-resolve-home-"));
+  try {
+    // A leftover trial home must no longer capture the unset-PASEO_HOME default.
+    mkdirSync(join(homeDir, ".paseo-factory"), { recursive: true });
+    assert.equal(existsSync(join(homeDir, ".paseo-factory")), true);
+
+    assert.equal(resolvePaseoHome({}, homeDir), join(homeDir, ".paseo"));
+    assert.equal(resolvePaseoHome({ PASEO_HOME: "" }, homeDir), join(homeDir, ".paseo"));
+    assert.equal(resolvePaseoHome({ PASEO_HOME: "   " }, homeDir), join(homeDir, ".paseo"));
+
+    // Explicit PASEO_HOME wins (trimmed), with ~-expansion preserved.
+    assert.equal(resolvePaseoHome({ PASEO_HOME: "/custom/paseo " }, homeDir), "/custom/paseo");
+    assert.equal(resolvePaseoHome({ PASEO_HOME: "~" }, homeDir), homeDir);
+    assert.equal(resolvePaseoHome({ PASEO_HOME: "~/paseo-trial" }, homeDir), join(homeDir, "paseo-trial"));
+  } finally {
+    rmSync(homeDir, { recursive: true, force: true });
+  }
+});
