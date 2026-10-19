@@ -1851,6 +1851,24 @@ function BurnRunDetailBody({
               lit={detail.run.landingStatus !== "not_landed"}
             />
           ) : null}
+          {detail.run.waveCount && detail.run.waveCount > 0 ? (
+            <Pill
+              theme={theme}
+              label={`Waves: ${detail.run.acceptedWaveCount ?? 0}/${detail.run.waveCount}`}
+              tone="accent"
+              lit
+              mono
+            />
+          ) : null}
+          {detail.run.retroOutcome ? (
+            <Pill
+              theme={theme}
+              label={`Retro: ${detail.run.retroOutcome} (${detail.run.retroProposalCount ?? 0} proposals)`}
+              tone={detail.run.retroOutcome === "written" ? "statusSuccess" : "foregroundMuted"}
+              lit={detail.run.retroOutcome === "written"}
+              mono
+            />
+          ) : null}
         </View>
         <Text style={text(theme, "code")}>
           Pipeline: {detail.statusHistory.join(" → ")}
@@ -1917,6 +1935,9 @@ function BurnRunDetailBody({
           {detail.framing.scope && detail.framing.scope.length > 0 ? (
             <Text style={text(theme, "code")}>Scope: {detail.framing.scope.join(", ")}</Text>
           ) : null}
+          {detail.framing.skills && detail.framing.skills.length > 0 ? (
+            <Text style={text(theme, "code")}>Skills: {detail.framing.skills.join(", ")}</Text>
+          ) : null}
           <Text style={text(theme, "code")}>
             Citation Gate Required: {detail.framing.citationRequired ? "yes" : "no"}
           </Text>
@@ -1959,6 +1980,12 @@ function BurnRunDetailBody({
                 tone={att.accepted ? "statusSuccess" : "statusDanger"}
                 lit
               />
+              {att.waveIndex ? (
+                <Pill theme={theme} label={`Wave ${att.waveIndex}`} tone="accent" lit mono />
+              ) : null}
+              {att.leadAccepted ? (
+                <Pill theme={theme} label="LEAD ACCEPTED" tone="statusSuccess" lit mono />
+              ) : null}
               <Pill theme={theme} label={att.model} mono />
               <Pill theme={theme} label={`family: ${att.family}`} />
               <Pill theme={theme} label={`Tries: ${att.attemptCount}`} mono />
@@ -1969,6 +1996,28 @@ function BurnRunDetailBody({
                   label={`Factory: ${att.factoryVerdict.toUpperCase()}`}
                   tone={att.factoryVerdict === "green" ? "statusSuccess" : "statusDanger"}
                   lit
+                />
+              ) : null}
+              {att.freshEyesOutcome ? (
+                <Pill
+                  theme={theme}
+                  label={`Fresh-Eyes: ${att.freshEyesOutcome.toUpperCase()}`}
+                  tone={
+                    att.freshEyesOutcome === "clear"
+                      ? "statusSuccess"
+                      : att.freshEyesOutcome === "concern"
+                        ? "statusDanger"
+                        : "foregroundMuted"
+                  }
+                  lit={att.freshEyesOutcome === "clear" || att.freshEyesOutcome === "concern"}
+                />
+              ) : null}
+              {att.watchOutcome ? (
+                <Pill
+                  theme={theme}
+                  label={`Watch: ${att.watchOutcome.toUpperCase()}`}
+                  tone={att.watchOutcome === "written" ? "statusSuccess" : "foregroundMuted"}
+                  lit={att.watchOutcome === "written"}
                 />
               ) : null}
               {att.gatePassed !== null ? (
@@ -1993,6 +2042,9 @@ function BurnRunDetailBody({
               <Text style={text(theme, "label", "statusWarning")}>
                 Rejected: {att.rejectionReason}
               </Text>
+            ) : null}
+            {att.freshEyesNotes ? (
+              <Text style={text(theme, "code")}>Fresh-Eyes: {att.freshEyesNotes}</Text>
             ) : null}
             <Text style={text(theme, "code")}>{att.output}</Text>
             {att.diffPatch !== null && att.diffPatch.trim() !== "" ? (

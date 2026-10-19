@@ -172,6 +172,14 @@ function summarizeRun(run: BurnRunRecord): BurnRunSummaryView {
     winningCommit: run.winningCommit ?? null,
     landingStatus: run.landingStatus ?? null,
     landingNote: run.landingNote ?? null,
+    waveCount:
+      run.wavesCompleted ??
+      Math.max(1, run.framing?.subtasks?.length ?? 1),
+    acceptedWaveCount:
+      run.wavesCompleted ?? run.attempts.filter((a) => a.leadAccepted).length,
+    retroOutcome: run.retroOutcome ?? null,
+    retroProposalsPath: run.retroProposalsPath ?? null,
+    retroProposalCount: run.retroProposalCount ?? null,
     hasReport: Boolean(run.reportMarkdown || run.reportPath),
     error: run.error ?? null,
   };
@@ -184,13 +192,18 @@ function toDetailView(run: BurnRunRecord): BurnRunDetailView {
     family: a.family,
     role: a.role,
     subtask: a.subtask,
+    waveIndex: a.wave ?? null,
     ok: a.ok,
     attemptCount: a.attemptCount ?? 1,
     latencyMs: a.latencyMs,
     output: a.output,
     accepted: a.accepted,
+    leadAccepted: a.leadAccepted ?? null,
     rejectionReason: a.rejectionReason ?? null,
     factoryVerdict: a.factoryVerdict ?? null,
+    freshEyesOutcome: a.freshEyesOutcome ?? null,
+    freshEyesNotes: a.freshEyesFinding ?? null,
+    watchOutcome: a.watchOutcome ?? null,
     changedFiles: a.changedFiles ?? [],
     diffPatch: a.diffPatch ?? null,
     gatePassed: a.gateResult ? a.gateResult.ok : null,
@@ -213,6 +226,7 @@ function toDetailView(run: BurnRunRecord): BurnRunDetailView {
           gateCommand: run.framing.gateCommand,
           ...(run.framing.artifact ? { artifact: run.framing.artifact } : {}),
           ...(run.framing.scope ? { scope: run.framing.scope } : {}),
+          ...(run.framing.skills ? { skills: run.framing.skills } : {}),
           citationRequired: run.framing.citationRequired,
         }
       : null,

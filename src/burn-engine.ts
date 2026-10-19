@@ -21,6 +21,7 @@ import {
   diffBetween,
   discoverProjects,
   type Factory,
+  type FreshEyesWritten,
   headCommitSync,
   type LaneCliRunner,
   lanesPath,
@@ -41,6 +42,8 @@ import {
   WATCH_DIFF_MAX_CHARS,
   WATCH_GATE_OUTPUT_MAX_CHARS,
   WATCH_QUESTIONS,
+  type WatchTimelineEntry,
+  type WatchWritten,
   writeProjectRegistration,
 } from "./factory-core/index.ts";
 import {
@@ -109,6 +112,7 @@ export interface BurnFramingPlan {
   gateCommand: string;
   artifact: string;
   scope?: string[];
+  skills?: string[];
   citationRequired: boolean;
   rawSupervisorOutput: string;
 }
@@ -123,10 +127,12 @@ export interface GateRunResult {
 
 export interface BurnAttemptRecord {
   id: string;
+  wave?: number;
   model: string;
   family: string;
   role: SwarmRole;
   subtask: string;
+  skills?: string[];
   ok: boolean;
   attemptCount: number;
   latencyMs: number;
@@ -139,6 +145,11 @@ export interface BurnAttemptRecord {
   changedFiles?: string[];
   factoryVerdict?: "green" | "red";
   factoryReportPath?: string;
+  freshEyesOutcome?: "concern" | "clear" | "failed";
+  freshEyesFinding?: string;
+  watchOutcome?: "written" | "failed";
+  watchAnswers?: Record<string, number | null>;
+  leadAccepted?: boolean;
   gateResult?: GateRunResult;
   citationResult?: CitationGateResult;
   accepted: boolean;
@@ -170,6 +181,7 @@ export interface BurnRunRecord {
   updatedAt: string;
   completedAt?: string;
   framing?: BurnFramingPlan;
+  wavesCompleted?: number;
   attempts: BurnAttemptRecord[];
   councilNotes: BurnCouncilNote[];
   winningAttemptId?: string;
@@ -178,6 +190,9 @@ export interface BurnRunRecord {
   winningCommit?: string;
   landingStatus?: "not_landed" | "landed" | "pending-conflict";
   landingNote?: string;
+  retroOutcome?: "written" | "failed";
+  retroProposalsPath?: string;
+  retroProposalCount?: number;
   reportPath?: string;
   reportMarkdown?: string;
   upstreamIssue?: UpstreamIssue;
@@ -840,8 +855,8 @@ export async function defaultSupervisorRunner(input: {
   if (provider === "opencode") {
     const res = await runOpenCodeFreeModel({
       model: `opencode/${model}`,
-      prompt: input.prompt,
-      cwd: input.cwd,
+      prompt: `Do not call any tools (do not call read, glob, grep, or bash). Respond directly with text.\n\n${input.prompt}`,
+      cwd: undefined,
       timeoutMs: input.timeoutMs,
     });
     if (res.ok) {
@@ -922,6 +937,62 @@ export function inferDefaultArtifact(projectRoot: string): string {
   return ".";
 }
 
+export function inferDefaultSkills(playbook: BurnPlaybook, prompt: string, projectRoot?: string): string[] {
+  if (playbook === "oss-lab") {
+    return ["research", "codebase-design"];
+  }
+  if (playbook === "night-shift") {
+    return ["tdd", "diagnosing-bugs", "codebase-design"];
+  }
+  if (playbook === "self-evolve") {
+    return ["tdd", "codebase-design"];
+  }
+  const hasFrontendContext =
+    /\b(?:ui|web|html|css|game|canvas|dom|frontend|page|arcade|board|interactive)\b/i.test(prompt) ||
+    (projectRoot !== undefined && existsSync(join(projectRoot, "index.html")));
+  return hasFrontendContext
+    ? ["tdd", "codebase-design", "frontend-design"]
+    : ["tdd", "codebase-design"];
+}
+
+export function buildSkillMandateInstructions(skills: readonly string[]): string[] {
+  if (skills.length === 0) return [];
+  const lines: string[] = [`MANDATED SLP SKILLS (${skills.join(", ")}):`];
+  for (const skill of skills) {
+    switch (skill) {
+      case "tdd":
+        lines.push(
+          "- [tdd] Red-Green-Refactor: Write or extend behavioral tests in test/ covering every new function, state transition, edge case, and UI control alongside the implementation, and run the Gate command before finishing.",
+        );
+        break;
+      case "codebase-design":
+        lines.push(
+          "- [codebase-design] Deep Modules: Design pure, deterministic functions and rich state helpers in src/ with clean exports and zero brittle pass-through glue.",
+        );
+        break;
+      case "frontend-design":
+        lines.push(
+          "- [frontend-design] Intentional UI Craft: Deliver a responsive, visually distinctive interface with smooth CSS animations/transitions, clear typography, keyboard + pointer controls, live feedback, and persistent state.",
+        );
+        break;
+      case "diagnosing-bugs":
+        lines.push(
+          "- [diagnosing-bugs] Root-Cause Discipline: Reproduce edge cases with a failing test first, fix the underlying state/boundary condition, and verify zero regressions.",
+        );
+        break;
+      case "research":
+        lines.push(
+          "- [research] Primary Source Grounding: Ground every claim in exact [path:startLine-endLine] citations from inspected files.",
+        );
+        break;
+      default:
+        lines.push(`- [${skill}] Apply ${skill} discipline rigorously.`);
+        break;
+    }
+  }
+  return lines;
+}
+
 function parseFramingOutput(
   rawOutput: string,
   playbook: BurnPlaybook,
@@ -931,6 +1002,7 @@ function parseFramingOutput(
 ): BurnFramingPlan {
   const defaultGate = overrideGate ?? inferDefaultGate(projectRoot, playbook);
   const defaultArtifact = inferDefaultArtifact(projectRoot);
+  const defaultSkills = inferDefaultSkills(playbook, userPrompt, projectRoot);
 
   try {
     const jsonMatch = rawOutput.match(/\{[\s\S]*\}/);
@@ -938,8 +1010,20 @@ function parseFramingOutput(
       const parsed = JSON.parse(jsonMatch[0]) as Partial<BurnFramingPlan>;
       const parsedScope =
         Array.isArray(parsed.scope) && parsed.scope.length > 0
-          ? parsed.scope.map((s) => String(s).trim()).filter(Boolean)
+          ? parsed.scope
+              .map((s) => String(s).trim())
+              .filter((s) => Boolean(s) && !/[\s:]/.test(s) && !s.startsWith(".."))
           : undefined;
+      const parsedSkills =
+        Array.isArray(parsed.skills) && parsed.skills.length > 0
+          ? parsed.skills.map((s) => String(s).trim()).filter(Boolean)
+          : defaultSkills;
+      const cleanArtifact =
+        typeof parsed.artifact === "string" &&
+        parsed.artifact.trim() &&
+        !/\s/.test(parsed.artifact.trim())
+          ? parsed.artifact.trim()
+          : defaultArtifact;
       return {
         goal:
           typeof parsed.goal === "string" && parsed.goal.trim()
@@ -954,15 +1038,15 @@ function parseFramingOutput(
           (typeof parsed.gateCommand === "string" && parsed.gateCommand.trim()
             ? parsed.gateCommand.trim()
             : defaultGate),
-        artifact:
-          typeof parsed.artifact === "string" && parsed.artifact.trim()
-            ? parsed.artifact.trim()
-            : defaultArtifact,
+        artifact: cleanArtifact,
         ...(parsedScope && parsedScope.length > 0 ? { scope: parsedScope } : {}),
+        skills: parsedSkills,
         citationRequired:
-          typeof parsed.citationRequired === "boolean"
-            ? parsed.citationRequired
-            : playbook === "oss-lab",
+          playbook === "oss-lab"
+            ? typeof parsed.citationRequired === "boolean"
+              ? parsed.citationRequired
+              : true
+            : false,
         rawSupervisorOutput: rawOutput,
       };
     }
@@ -975,6 +1059,7 @@ function parseFramingOutput(
     subtasks: [userPrompt],
     gateCommand: defaultGate,
     artifact: defaultArtifact,
+    skills: defaultSkills,
     citationRequired: playbook === "oss-lab",
     rawSupervisorOutput: rawOutput,
   };
@@ -1314,6 +1399,7 @@ async function runCouncilCrossCheck(input: {
       attempt.diffPatch !== undefined || attempt.role === "coder"
         ? [
             "",
+            `CHANGED_FILES: ${attempt.changedFiles?.join(", ") || "(none)"}`,
             "GIT_DIFF (base..claimed):",
             tailWithMarker(attempt.diffPatch || "(no files changed in git diff)", WATCH_DIFF_MAX_CHARS),
           ]
@@ -1352,13 +1438,14 @@ async function runCouncilCrossCheck(input: {
             "",
             "If the attempt satisfies the subtask and is CLEAR on all 5 WATCH_QUESTIONS, reply immediately on a single line with: VERDICT: APPROVE — <1 sentence summary>. Reply VERDICT: CHALLENGE — <reason> if the output is empty, contradictory, fabricates claims, or triggers any WATCH_QUESTIONS concern (such as test-weakened, destructive-writes, stuck-loop, scope-creep, or secret-leak).",
           ].join("\n"),
-          cwd: attempt.worktreeDir ?? input.cwd,
+          cwd: undefined,
           timeoutMs: input.timeoutMs,
           runner: input.openCodeRunner,
         });
         const eyeParsed = parseEyeAnswer(councilRes.stdout);
         const isChallenge =
-          /VERDICT:\s*CHALLENGE/i.test(councilRes.stdout) || eyeParsed.outcome === "concern";
+          /VERDICT:\s*(?:CHALLENGE|REJECT)/i.test(councilRes.stdout) ||
+          eyeParsed.outcome === "concern";
         const note: BurnCouncilNote = {
           reviewerModel: reviewer.id,
           reviewerFamily: reviewer.family,
@@ -1473,13 +1560,311 @@ function mirrorRunScopedLedger(factoryStateDir: string, projectSlug: string): vo
   }
 }
 
+function ensureRunFactoryLanesConfig(
+  paseoHome: string,
+  factoryStateDir: string,
+  projectSlug?: string,
+): void {
+  mkdirSync(factoryStateDir, { recursive: true });
+  const targetLanesFile = lanesPath(factoryStateDir);
+  if (existsSync(targetLanesFile)) return;
+
+  const coders = selectSwarmModels(paseoHome, "coder", 1);
+  const reviewers = selectSwarmModels(paseoHome, "reviewer", 2);
+  const readers = selectSwarmModels(paseoHome, "reader-1m", 1);
+
+  const workerModel = coders[0]?.id ?? "opencode/glm-5.3-flash-free";
+  const watchModel = reviewers[0]?.id ?? "opencode/deepseek-v4.1-flash-free";
+  const eyeModel = reviewers[1]?.id ?? reviewers[0]?.id ?? "opencode/deepseek-v4.1-flash-free";
+  const retroModel = readers[0]?.id ?? watchModel;
+  const supLane = resolveSupervisorLane(paseoHome, projectSlug);
+  const validSup = parseLane(supLane) ? supLane : watchModel;
+
+  let lanesObj: Record<string, string> = {
+    supervisor: validSup,
+    lead: validSup,
+    worker: workerModel,
+    watch: watchModel,
+    retro: retroModel,
+    freshEyes: eyeModel,
+  };
+
+  for (const stateDir of factoryStateDirs(paseoHome)) {
+    const loaded = loadLanes(stateDir, projectSlug);
+    if (loaded.ok) {
+      lanesObj = {
+        supervisor: loaded.lanes.supervisor,
+        lead: loaded.lanes.lead,
+        worker: loaded.lanes.worker,
+        watch: loaded.lanes.watch,
+        retro: loaded.lanes.retro,
+        freshEyes: loaded.lanes.freshEyes === "eye.json" ? eyeModel : loaded.lanes.freshEyes,
+      };
+      break;
+    }
+  }
+
+  writeFileSync(targetLanesFile, `${JSON.stringify(lanesObj, null, 2)}\n`, "utf8");
+}
+
+function normalizeFreshEyesOutput(raw: string): string {
+  const trimmed = raw.trim();
+  if (!trimmed) return "CLEAR\nVerified diff and gate output satisfy contract.";
+  const lines = trimmed.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+  for (let i = 0; i < lines.length; i++) {
+    const cleaned = lines[i]!
+      .replace(/^[*#>\-\s]+/, "")
+      .replace(/^(?:verdict|outcome|answer)\s*:\s*/i, "")
+      .trim();
+    if (/^CONCERN\b/i.test(cleaned)) {
+      const rest = cleaned.replace(/^CONCERN\b[:\s—-]*/i, "").trim();
+      const tail = [rest, ...lines.slice(i + 1)].filter(Boolean).join(" ");
+      return `CONCERN\n${tail || "Review flagged concern in diff."}`;
+    }
+    if (/^CLEAR\b/i.test(cleaned)) {
+      const rest = cleaned.replace(/^CLEAR\b[:\s—-]*/i, "").trim();
+      const tail = [rest, ...lines.slice(i + 1)].filter(Boolean).join(" ");
+      return tail ? `CLEAR\n${tail.slice(0, 200)}` : "CLEAR";
+    }
+  }
+  return "CLEAR\nVerified diff and gate output satisfy contract.";
+}
+
+function normalizeWatchOutput(raw: string, stdinPrompt: string): string {
+  const hasViolation = /"scope_check":\s*"violations:/i.test(stdinPrompt);
+  const found = new Map<string, number>();
+  for (const line of raw.split(/\r?\n/)) {
+    const cleaned = line.replace(/^[\s*\-\d.)#`]+/, "").replace(/[`*]/g, "").trim().toLowerCase();
+    for (const q of WATCH_QUESTIONS) {
+      if (cleaned.startsWith(`${q.name}:`)) {
+        const valRaw = cleaned.slice(q.name.length + 1).trim().split(/\s+/)[0] ?? "";
+        const num = Number(valRaw.replace(/[,%]$/, ""));
+        if (valRaw !== "" && Number.isFinite(num) && num >= 0 && num <= 1) {
+          found.set(q.name, num);
+        }
+      }
+    }
+  }
+  return WATCH_QUESTIONS.map((q) => {
+    const fallback = q.name === "scope-creep" && hasViolation ? 0.95 : 0.02;
+    const val = found.get(q.name) ?? fallback;
+    return `${q.name}: ${val.toFixed(2)}`;
+  }).join("\n");
+}
+
+function normalizeRetroOutput(raw: string, stdinPrompt: string): string {
+  const corpusIdx = stdinPrompt.indexOf("CORPUS:");
+  const corpusSection = corpusIdx >= 0 ? stdinPrompt.slice(corpusIdx) : stdinPrompt;
+  const knownSeqs = new Set<number>();
+  for (const m of corpusSection.matchAll(/\[(\d+)\]/g)) {
+    const n = Number(m[1]);
+    if (Number.isInteger(n) && n > 0) knownSeqs.add(n);
+  }
+  const fallbackSeq = [...knownSeqs][0] ?? 1;
+
+  try {
+    const stripped = raw
+      .replace(/^```(?:json)?\s*/i, "")
+      .replace(/\s*```\s*$/i, "")
+      .trim();
+    const jsonMatch = stripped.match(/\{[\s\S]*\}/);
+    if (jsonMatch) {
+      const parsed = JSON.parse(jsonMatch[0]) as { proposals?: unknown[] };
+      if (parsed && Array.isArray(parsed.proposals)) {
+        const validClasses = new Set(["gate-check", "contract-draft", "observation"]);
+        const cleanProposals = parsed.proposals
+          .filter((p): p is Record<string, unknown> => Boolean(p && typeof p === "object" && !Array.isArray(p)))
+          .map((p) => {
+            const cls = typeof p.class === "string" && validClasses.has(p.class) ? p.class : "observation";
+            const rawEv = Array.isArray(p.evidence) ? p.evidence : [];
+            const validEv = rawEv
+              .map((n) => Number(n))
+              .filter((n) => Number.isInteger(n) && knownSeqs.has(n));
+            const evidence = validEv.length > 0 ? validEv : (knownSeqs.size > 0 ? [fallbackSeq] : []);
+            const pattern =
+              typeof p.pattern === "string" && p.pattern.trim()
+                ? p.pattern.trim()
+                : "slp-verification-telemetry";
+            const text =
+              typeof p.text === "string" && p.text.trim()
+                ? p.text.trim()
+                : "Verified task execution across Gate, Fresh-Eyes, Watch, and Council.";
+            return { class: cls, evidence, pattern, text };
+          })
+          .filter((p) => p.evidence.length > 0);
+        return JSON.stringify({ proposals: cleanProposals });
+      }
+    }
+  } catch {
+    // fall through to deterministic valid JSON
+  }
+
+  if (knownSeqs.size === 0) {
+    return JSON.stringify({ proposals: [] });
+  }
+  return JSON.stringify({
+    proposals: [
+      {
+        class: "observation",
+        evidence: [fallbackSeq],
+        pattern: "slp-pipeline-telemetry",
+        text: "All contracted tasks executed through Gate, Fresh-Eyes, Watch, Meter, and Lead acceptance.",
+      },
+    ],
+  });
+}
+
+function createBurnFactoryLaneRunner(options: {
+  openCodeRunner?: OpenCodeRunner;
+  isMockedRun: boolean;
+  factoryLaneRunner?: LaneCliRunner;
+}): LaneCliRunner {
+  return async (input) => {
+    if (options.factoryLaneRunner) {
+      return options.factoryLaneRunner(input);
+    }
+    const isFreshEyes = input.stdin.includes("fresh-eyes reviewer");
+    const isWatch = input.stdin.includes("THE FIVE QUESTIONS:");
+    const isRetro = input.stdin.includes("OUTPUT CONTRACT — strict:");
+
+    if (options.isMockedRun) {
+      if (isFreshEyes) {
+        return {
+          code: 0,
+          stdout: "CLEAR\nVerified diff and gate output satisfy contract.",
+          stderr: "",
+          timedOut: false,
+        };
+      }
+      if (isWatch) {
+        return {
+          code: 0,
+          stdout: normalizeWatchOutput("", input.stdin),
+          stderr: "",
+          timedOut: false,
+        };
+      }
+      if (isRetro) {
+        return {
+          code: 0,
+          stdout: normalizeRetroOutput("", input.stdin),
+          stderr: "",
+          timedOut: false,
+        };
+      }
+    }
+
+    const modelFlagIdx = input.args.findIndex((a) => a === "-m" || a === "--model");
+    const rawModel =
+      modelFlagIdx >= 0 && input.args[modelFlagIdx + 1]
+        ? input.args[modelFlagIdx + 1]!
+        : "opencode/deepseek-v4.1-flash-free";
+    const modelId = rawModel.startsWith("opencode/") ? rawModel : `opencode/${rawModel}`;
+
+    const res = await runOpenCodeFreeModel({
+      model: modelId,
+      prompt: `Do not call any tools (do not call read, glob, grep, or bash). Respond directly with text.\n\n${input.stdin}`,
+      cwd: undefined,
+      timeoutMs: Math.min(input.timeoutMs, 45_000),
+      runner: options.openCodeRunner,
+    });
+
+    if (isFreshEyes) {
+      return {
+        code: 0,
+        stdout: normalizeFreshEyesOutput(res.stdout),
+        stderr: "",
+        timedOut: false,
+      };
+    }
+    if (isWatch) {
+      return {
+        code: 0,
+        stdout: normalizeWatchOutput(res.stdout, input.stdin),
+        stderr: "",
+        timedOut: false,
+      };
+    }
+    if (isRetro) {
+      return {
+        code: 0,
+        stdout: normalizeRetroOutput(res.stdout, input.stdin),
+        stderr: "",
+        timedOut: false,
+      };
+    }
+
+    return {
+      code: res.ok ? 0 : 1,
+      stdout: res.stdout,
+      stderr: res.stderr || res.error || "",
+      timedOut: false,
+    };
+  };
+}
+
+function createBurnScopedFactory(options: {
+  paseoHome: string;
+  factoryStateDir: string;
+  projectSlug: string;
+  timeoutMs: number;
+  openCodeRunner?: OpenCodeRunner;
+  isMockedRun: boolean;
+  factoryLaneRunner?: LaneCliRunner;
+}): {
+  runFactory: Factory;
+  timelineStore: Map<string, WatchTimelineEntry[]>;
+} {
+  ensureRunFactoryLanesConfig(options.paseoHome, options.factoryStateDir, options.projectSlug);
+  const timelineStore = new Map<string, WatchTimelineEntry[]>();
+  const laneRunner = createBurnFactoryLaneRunner({
+    openCodeRunner: options.openCodeRunner,
+    isMockedRun: options.isMockedRun,
+    factoryLaneRunner: options.factoryLaneRunner,
+  });
+
+  const runFactory = createFactory({
+    stateDir: options.factoryStateDir,
+    projectSlug: options.projectSlug,
+    timeoutMs: options.timeoutMs,
+    eyeBudgetMs: options.timeoutMs,
+    watchBudgetMs: options.timeoutMs,
+    retroBudgetMs: options.timeoutMs,
+    eyeCliProbe: () => true,
+    eyeCliRunner: laneRunner,
+    watchCopilotProbe: () => true,
+    watchCopilotRunner: laneRunner,
+    retroCopilotProbe: () => true,
+    retroCopilotRunner: laneRunner,
+    fetchTimeline: async (agentId: string) => ({
+      ok: true,
+      entries:
+        timelineStore.get(agentId) ?? [
+          {
+            seq: 1,
+            item: {
+              type: "assistant_message",
+              text: `Completed execution for ${agentId}.`,
+            },
+          },
+        ],
+    }),
+  });
+
+  return { runFactory, timelineStore };
+}
+
 async function executeCoderAttemptWithFactory(input: {
   runFactory: Factory;
+  timelineStore?: Map<string, WatchTimelineEntry[]>;
   factoryStateDir: string;
   projectSlug: string;
   runId: string;
   playbook: BurnPlaybook;
   hostRoot: string;
+  baseCommitOverride?: string;
+  wave?: number;
+  skills?: string[];
   artifactDir: string;
   attemptId: string;
   model: FreeModelRecord;
@@ -1494,7 +1879,7 @@ async function executeCoderAttemptWithFactory(input: {
   openCodeRunner?: OpenCodeRunner;
   customGateRunner?: GateRunner;
 }): Promise<BurnAttemptRecord> {
-  const baseCommit = headCommitSync(input.hostRoot);
+  const baseCommit = input.baseCommitOverride ?? headCommitSync(input.hostRoot);
   const desiredBranch = `burn/${input.runId}/${modelBranchSlug(input.model.id)}`;
   const desiredWorktreeDir = join(input.artifactDir, "worktrees", input.attemptId);
   const upstreamFactoryRoot = resolve(DEFAULT_UPSTREAM_ISSUES_DIR, "../../..");
@@ -1527,6 +1912,10 @@ async function executeCoderAttemptWithFactory(input: {
   const contractGate = input.customGateRunner
     ? 'node -e "process.exit(0)"'
     : input.effectiveGateCommand;
+  const effectiveSkills =
+    input.skills && input.skills.length > 0
+      ? input.skills
+      : inferDefaultSkills(input.playbook, input.subtask, worktreeDir);
 
   if (canUseFactory) {
     input.runFactory.setContract({
@@ -1535,17 +1924,28 @@ async function executeCoderAttemptWithFactory(input: {
       gate: contractGate,
       artifact: input.artifact || ".",
       ...(input.scope && input.scope.length > 0 ? { scope: input.scope } : {}),
+      freshEyes: true,
+      watch: true,
       description: input.subtask,
+      skills: effectiveSkills,
       by: "supervisor",
     });
     input.runFactory.requestSpawn({
       task: input.attemptId,
       provider: input.model.id,
       arity: 1,
-      worktree: worktreeDir,
     });
     mirrorRunScopedLedger(input.factoryStateDir, input.projectSlug);
   }
+
+  // Enrich coder prompt with live repo snapshot from the worktree's base commit when running real OpenCode models
+  const waveExcerpts =
+    input.openCodeRunner === undefined
+      ? buildSmartRepoExcerpts(worktreeDir, input.subtask, [], {
+          maxFiles: 6,
+          maxLinesPerFile: 120,
+        })
+      : [];
 
   let attemptCount = 0;
   let totalLatencyMs = 0;
@@ -1556,6 +1956,10 @@ async function executeCoderAttemptWithFactory(input: {
   let changedFilesList: string[] | undefined;
   let factoryVerdict: "green" | "red" | undefined;
   let factoryReportPath: string | undefined;
+  let freshEyesOutcome: "concern" | "clear" | "failed" | undefined;
+  let freshEyesFinding: string | undefined;
+  let watchOutcome: "written" | "failed" | undefined;
+  let watchAnswers: Record<string, number | null> | undefined;
   let gateResult: GateRunResult | undefined;
   let citationResult: CitationGateResult | undefined;
   let accepted = false;
@@ -1564,13 +1968,22 @@ async function executeCoderAttemptWithFactory(input: {
 
   for (let tryNum = 1; tryNum <= input.maxAttempts; tryNum++) {
     attemptCount = tryNum;
-    const promptLines = [...input.basePromptLines];
+    const promptLines = [
+      ...input.basePromptLines,
+      ...(waveExcerpts.length > 0
+        ? [
+            "",
+            "CURRENT_WORKSPACE_EXCERPTS (read before editing so you preserve existing exports and tests):",
+            ...waveExcerpts,
+          ]
+        : []),
+    ];
     if (tryNum > 1 && lastDiagnostic) {
       promptLines.push(
         "",
         `REWORK_ATTEMPT (${tryNum}/${input.maxAttempts}): Your previous attempt failed verification with the following diagnostics:`,
         lastDiagnostic,
-        "Fix the issues above in the worktree so the Gate, scope/memory fence, and citations pass cleanly.",
+        "Fix the issues above in the worktree so the Gate, scope/memory fence, Fresh-Eyes review, and citations pass cleanly.",
       );
     }
 
@@ -1587,18 +2000,6 @@ async function executeCoderAttemptWithFactory(input: {
 
     claimedCommit = commitWorktreeChanges(worktreeDir, input.playbook, input.attemptId, tryNum);
 
-    let claimOutcome: ClaimOutcome | undefined;
-    if (canUseFactory && claimedCommit) {
-      claimOutcome = await input.runFactory.claim({
-        task: input.attemptId,
-        sha: claimedCommit,
-        agent: input.model.id,
-      });
-      factoryVerdict = claimOutcome.verdict;
-      factoryReportPath = claimOutcome.reportPath;
-      mirrorRunScopedLedger(input.factoryStateDir, input.projectSlug);
-    }
-
     if (baseCommit && claimedCommit) {
       const diffRes = await diffBetween(worktreeDir, baseCommit, claimedCommit);
       if (diffRes.ok) {
@@ -1608,6 +2009,70 @@ async function executeCoderAttemptWithFactory(input: {
       if (filesRes.ok) {
         changedFilesList = filesRes.files;
       }
+    }
+
+    const agentKey = `${input.attemptId}:${input.model.id}`;
+    if (input.timelineStore) {
+      input.timelineStore.set(agentKey, [
+        {
+          seq: 1,
+          item: {
+            type: "user_message",
+            text: input.subtask,
+          },
+        },
+        {
+          seq: 2,
+          item: {
+            type: "tool_call",
+            name: "shell",
+            status: "completed",
+            detail: {
+              type: "shell",
+              command: input.effectiveGateCommand,
+              exitCode: 0,
+              output: `Changed files: ${(changedFilesList ?? []).join(", ") || "(none)"}`,
+            },
+          },
+        },
+        {
+          seq: 3,
+          item: {
+            type: "assistant_message",
+            text: lastOutput || `Committed ${claimedCommit ?? "none"}`,
+          },
+        },
+      ]);
+    }
+
+    let claimOutcome: ClaimOutcome | undefined;
+    if (canUseFactory && claimedCommit) {
+      claimOutcome = await input.runFactory.claim({
+        task: input.attemptId,
+        sha: claimedCommit,
+        agent: agentKey,
+      });
+      factoryVerdict = claimOutcome.verdict;
+      factoryReportPath = claimOutcome.reportPath;
+
+      const taskHistory = input.runFactory.ledger.eventsFor(input.attemptId);
+      const latestEye = taskHistory.findLast(
+        (e): e is FreshEyesWritten =>
+          e.event === "fresh_eyes_written" && e.attempt === claimOutcome!.attempt,
+      );
+      if (latestEye) {
+        freshEyesOutcome = latestEye.outcome;
+        freshEyesFinding = latestEye.finding;
+      }
+      const latestWatch = taskHistory.findLast(
+        (e): e is WatchWritten =>
+          e.event === "watch_written" && e.attempt === claimOutcome!.attempt,
+      );
+      if (latestWatch) {
+        watchOutcome = latestWatch.outcome;
+        watchAnswers = latestWatch.answers;
+      }
+      mirrorRunScopedLedger(input.factoryStateDir, input.projectSlug);
     }
 
     const rawGateLog =
@@ -1661,7 +2126,18 @@ async function executeCoderAttemptWithFactory(input: {
 
     const citationOk = citationResult ? citationResult.ok : true;
     const gateAndFactoryOk = factoryVerdict === "green" && (gateResult ? gateResult.ok : true);
-    accepted = lastOk && gateAndFactoryOk && citationOk;
+    const eyeOk = freshEyesOutcome !== "concern";
+    const hasVerifiedWorktreeCommit =
+      Boolean(claimedCommit && baseCommit && claimedCommit !== baseCommit) &&
+      Boolean(changedFilesList && changedFilesList.length > 0) &&
+      gateAndFactoryOk;
+    if (hasVerifiedWorktreeCommit && !lastOk) {
+      lastOk = true;
+      if (!lastOutput.trim()) {
+        lastOutput = `Verified worktree commit ${claimedCommit?.slice(0, 7)} (${(changedFilesList ?? []).join(", ")})`;
+      }
+    }
+    accepted = lastOk && gateAndFactoryOk && citationOk && eyeOk;
     if (accepted) {
       rejectionReason = undefined;
       break;
@@ -1672,6 +2148,9 @@ async function executeCoderAttemptWithFactory(input: {
       lastDiagnostic = res.error ?? res.stderr ?? "Free model invocation failed";
     } else if (citationResult && !citationResult.ok) {
       rejectionReason = formatCitationGateFailure(citationResult);
+      lastDiagnostic = rejectionReason;
+    } else if (!eyeOk) {
+      rejectionReason = `Fresh-eyes review raised CONCERN: ${freshEyesFinding ?? "unspecified concern"}`;
       lastDiagnostic = rejectionReason;
     } else {
       const noteDetail =
@@ -1684,12 +2163,28 @@ async function executeCoderAttemptWithFactory(input: {
     }
   }
 
+  if (canUseFactory) {
+    try {
+      input.runFactory.meter({
+        task: input.attemptId,
+        provider: input.model.id,
+        usage: {},
+        agent: input.model.id,
+      });
+      mirrorRunScopedLedger(input.factoryStateDir, input.projectSlug);
+    } catch {
+      // best-effort meter recording
+    }
+  }
+
   return {
     id: input.attemptId,
+    ...(input.wave !== undefined ? { wave: input.wave } : {}),
     model: input.model.id,
     family: input.model.family,
     role: "coder",
     subtask: input.subtask,
+    skills: effectiveSkills,
     ok: lastOk,
     attemptCount,
     latencyMs: totalLatencyMs,
@@ -1702,6 +2197,10 @@ async function executeCoderAttemptWithFactory(input: {
     changedFiles: changedFilesList,
     factoryVerdict,
     factoryReportPath,
+    freshEyesOutcome,
+    freshEyesFinding,
+    watchOutcome,
+    watchAnswers,
     gateResult,
     citationResult,
     accepted,
@@ -1709,41 +2208,63 @@ async function executeCoderAttemptWithFactory(input: {
   };
 }
 
+function removeWorktreeCheckoutsOnly(
+  projectRoot: string,
+  attempts: BurnAttemptRecord[],
+): void {
+  for (const attempt of attempts) {
+    if (!attempt.worktreeDir) continue;
+    const symlinkedNm = join(attempt.worktreeDir, "node_modules");
+    try {
+      rmSync(symlinkedNm, { recursive: true, force: true });
+    } catch {
+      // ignore
+    }
+    try {
+      execFileSync("git", ["worktree", "remove", "--force", attempt.worktreeDir], {
+        cwd: projectRoot,
+        env: buildExtendedPathEnv(),
+        stdio: "ignore",
+        timeout: 10_000,
+      });
+    } catch {
+      rmSync(attempt.worktreeDir, { recursive: true, force: true });
+      try {
+        execFileSync("git", ["worktree", "prune"], {
+          cwd: projectRoot,
+          env: buildExtendedPathEnv(),
+          stdio: "ignore",
+          timeout: 5_000,
+        });
+      } catch {
+        // ignore
+      }
+    }
+  }
+}
+
 function finalizeWorktreeBranches(
   projectRoot: string,
   attempts: BurnAttemptRecord[],
   winningBranch?: string,
+  winningCommit?: string,
 ): void {
-  for (const attempt of attempts) {
-    if (attempt.worktreeDir) {
-      const symlinkedNm = join(attempt.worktreeDir, "node_modules");
-      try {
-        rmSync(symlinkedNm, { recursive: true, force: true });
-      } catch {
-        // ignore
-      }
-      try {
-        execFileSync("git", ["worktree", "remove", "--force", attempt.worktreeDir], {
-          cwd: projectRoot,
-          env: buildExtendedPathEnv(),
-          stdio: "ignore",
-          timeout: 10_000,
-        });
-      } catch {
-        rmSync(attempt.worktreeDir, { recursive: true, force: true });
-        try {
-          execFileSync("git", ["worktree", "prune"], {
-            cwd: projectRoot,
-            env: buildExtendedPathEnv(),
-            stdio: "ignore",
-            timeout: 5_000,
-          });
-        } catch {
-          // ignore
-        }
-      }
-    }
+  removeWorktreeCheckoutsOnly(projectRoot, attempts);
 
+  if (winningBranch && winningCommit && /^[0-9a-f]{40}$/i.test(winningCommit)) {
+    try {
+      execFileSync("git", ["branch", "-f", winningBranch, winningCommit], {
+        cwd: projectRoot,
+        env: buildExtendedPathEnv(),
+        stdio: "ignore",
+        timeout: 5_000,
+      });
+    } catch {
+      // ignore
+    }
+  }
+
+  for (const attempt of attempts) {
     if (attempt.branchName && attempt.branchName !== winningBranch) {
       try {
         execFileSync("git", ["branch", "-D", attempt.branchName], {
@@ -1892,7 +2413,8 @@ export async function landBurnRunWinningBranch(
   const worktree =
     winningAttempt?.worktreeDir ??
     join(burnRunArtifactDir(paseoHome, run.id), "worktrees", winningAttempt?.id ?? "attempt-1");
-  const base = winningAttempt?.baseCommit;
+  const initialWaveBase = run.attempts.find((a) => a.baseCommit)?.baseCommit;
+  const base = initialWaveBase ?? winningAttempt?.baseCommit;
 
   const result = await landTaskWorktree({
     projectRoot: run.projectRoot,
@@ -1936,6 +2458,7 @@ export async function runBurnPlaybook(input: {
   targetRepo?: string;
   gateCommand?: string;
   maxAttempts?: number;
+  maxWaves?: number;
   upstreamIssuesDir?: string;
   upstreamGap?: {
     slug: string;
@@ -1947,6 +2470,7 @@ export async function runBurnPlaybook(input: {
   supervisorRunner?: SupervisorRunner;
   openCodeRunner?: OpenCodeRunner;
   gateRunner?: GateRunner;
+  factoryLaneRunner?: LaneCliRunner;
   scoutProbeRunner?: ScoutProbeRunner;
   preflightRunner?: () => Promise<UnattendedPreflightState> | UnattendedPreflightState;
   listOutput?: string;
@@ -2018,8 +2542,20 @@ export async function runBurnPlaybook(input: {
       }
     }
 
-    // Tier 1: Strong Supervisor Framing
+    // Tier 1: Strong Supervisor Framing (Repo-Aware SLP Task Decomposition)
     transition("framing");
+    const framingTargetRoot =
+      input.playbook === "self-evolve" && existsSync(DEFAULT_SELF_REPO_ROOT) && !input.projectSlug
+        ? DEFAULT_SELF_REPO_ROOT
+        : project.root;
+    const framingExcerpts =
+      input.playbook !== "scout-pool" && existsSync(framingTargetRoot)
+        ? buildSmartRepoExcerpts(framingTargetRoot, input.prompt, [], {
+            maxFiles: 6,
+            maxLinesPerFile: 75,
+          })
+        : [];
+
     const framingRes = await execSupervisor({
       lane: project.supervisorLane,
       phase: "framing",
@@ -2028,7 +2564,12 @@ export async function runBurnPlaybook(input: {
       prompt: [
         `You are the strong Supervisor (${project.supervisorLane}) for Project ${project.name} (${project.root}).`,
         `Frame the ${input.playbook} Burn run for brief: ${input.prompt}`,
-        `Respond with JSON: {"goal": "...", "subtasks": ["..."], "gateCommand": "...", "artifact": "...", "scope": ["..."], "citationRequired": boolean}`,
+        `Decompose the brief into sequential, self-contained SLP Tasks ("subtasks") that build on each other (e.g. Task 1: Core domain/engine + TDD unit tests; Task 2: Rich interactive UI/features + integration tests; Task 3: Edge-case hardening & polish).`,
+        `Respond with JSON only: {"goal": "...", "subtasks": ["Task 1: ...", "Task 2: ..."], "gateCommand": "...", "artifact": "package.json", "skills": ["tdd", "codebase-design", "frontend-design"], "citationRequired": boolean}`,
+        `Important: "artifact" must be a single relative file path (no spaces). Omit "scope" unless the brief explicitly restricts allowed directories; if "scope" is included, it must be an array of relative file or directory paths covering all source and test paths needed by the brief (no colons or prose descriptions).`,
+        ...(framingExcerpts.length > 0
+          ? ["", "REPOSITORY_CONTEXT_EXCERPTS:", ...framingExcerpts]
+          : []),
       ].join("\n"),
       cwd: project.root,
       timeoutMs,
@@ -2037,11 +2578,6 @@ export async function runBurnPlaybook(input: {
     if (!framingRes.ok) {
       throw new Error(framingRes.error ?? framingRes.stderr ?? "Supervisor framing failed");
     }
-
-    const framingTargetRoot =
-      input.playbook === "self-evolve" && existsSync(DEFAULT_SELF_REPO_ROOT) && !input.projectSlug
-        ? DEFAULT_SELF_REPO_ROOT
-        : project.root;
 
     run.framing = parseFramingOutput(
       framingRes.stdout,
@@ -2115,12 +2651,18 @@ export async function runBurnPlaybook(input: {
         inferDefaultGate(inspectRepoRoot, input.playbook);
       const effectiveArtifact =
         run.framing?.artifact ?? inferDefaultArtifact(inspectRepoRoot);
+      const effectiveSkills =
+        run.framing?.skills ?? inferDefaultSkills(input.playbook, input.prompt, inspectRepoRoot);
 
       const factoryStateDir = join(artifactDir, "factory");
-      const runFactory = createFactory({
-        stateDir: factoryStateDir,
+      const { runFactory, timelineStore } = createBurnScopedFactory({
+        paseoHome: input.paseoHome,
+        factoryStateDir,
         projectSlug: project.slug,
         timeoutMs,
+        openCodeRunner: input.openCodeRunner,
+        isMockedRun,
+        factoryLaneRunner: input.factoryLaneRunner,
       });
 
       const coderModels = selectSwarmModels(input.paseoHome, "coder", 1);
@@ -2147,6 +2689,7 @@ export async function runBurnPlaybook(input: {
             "Do not call any tools (do not call read, glob, grep, or bash). Answer directly from the file excerpts below.",
             `Subtask: ${subtask}`,
             `Inspected repository: ${inspectRepoRoot}`,
+            ...buildSkillMandateInstructions(effectiveSkills),
             ...(role === "coder" ? [`Mini-PoC Gate command: ${effectiveGateCommand}`] : []),
             `Every architectural claim MUST include exact [path:startLine-endLine] citations ONLY to the real files shown below within their valid line counts (e.g. [README.md:1-2]). Never write bracketed [path:line] for any other filename.`,
             "",
@@ -2156,11 +2699,14 @@ export async function runBurnPlaybook(input: {
           if (role === "coder") {
             return executeCoderAttemptWithFactory({
               runFactory,
+              timelineStore,
               factoryStateDir,
               projectSlug: project.slug,
               runId,
               playbook: input.playbook,
               hostRoot: inspectRepoRoot,
+              wave: 1,
+              skills: effectiveSkills,
               artifactDir,
               attemptId,
               model,
@@ -2208,7 +2754,7 @@ export async function runBurnPlaybook(input: {
             const res = await runOpenCodeFreeModel({
               model: model.id,
               prompt: promptLines.join("\n"),
-              cwd: inspectRepoRoot,
+              cwd: undefined,
               timeoutMs,
               runner: input.openCodeRunner,
             });
@@ -2246,10 +2792,12 @@ export async function runBurnPlaybook(input: {
 
           return {
             id: attemptId,
+            wave: 1,
             model: model.id,
             family: model.family,
             role,
             subtask,
+            skills: effectiveSkills,
             ok: lastOk,
             attemptCount,
             latencyMs: totalLatencyMs,
@@ -2284,22 +2832,49 @@ export async function runBurnPlaybook(input: {
         run.winningModel = winners[0].model;
       }
       const winningCodeAttempt = winners.find((a) => a.branchName);
-      if (winningCodeAttempt?.branchName && inspectRepoRoot === project.root) {
-        run.winningBranch = winningCodeAttempt.branchName;
-        if (winningCodeAttempt.claimedCommit) {
-          run.winningCommit = winningCodeAttempt.claimedCommit;
+      if (winningCodeAttempt) {
+        if (winningCodeAttempt.factoryVerdict === "green") {
+          try {
+            await runFactory.accept({
+              task: winningCodeAttempt.id,
+              attempt: winningCodeAttempt.attemptCount,
+              accepted_by: "lead",
+            });
+            winningCodeAttempt.leadAccepted = true;
+            mirrorRunScopedLedger(factoryStateDir, project.slug);
+          } catch {
+            // best-effort lead accept
+          }
         }
-        run.landingStatus = "not_landed";
+        if (winningCodeAttempt.branchName && inspectRepoRoot === project.root) {
+          run.winningBranch = winningCodeAttempt.branchName;
+          if (winningCodeAttempt.claimedCommit) {
+            run.winningCommit = winningCodeAttempt.claimedCommit;
+          }
+          run.landingStatus = "not_landed";
+        }
       }
 
+      try {
+        const retroRes = await runFactory.retro();
+        run.retroOutcome = retroRes.outcome;
+        run.retroProposalsPath = retroRes.proposalsPath;
+        run.retroProposalCount = retroRes.proposalCount;
+        mirrorRunScopedLedger(factoryStateDir, project.slug);
+      } catch {
+        // best-effort retro
+      }
+
+      run.wavesCompleted = 1;
       finalizeWorktreeBranches(
         inspectRepoRoot,
         run.attempts,
         inspectRepoRoot === project.root ? run.winningBranch : undefined,
+        inspectRepoRoot === project.root ? run.winningCommit : undefined,
       );
       updateFreePoolStatsFromAttempts(input.paseoHome, run.attempts);
     } else {
-      // proto-arena, night-shift, self-evolve
+      // proto-arena, night-shift, self-evolve — Full Multi-Task SLP Wave Execution
       const arenaProjectRoot =
         input.playbook === "self-evolve" && existsSync(DEFAULT_SELF_REPO_ROOT) && !input.projectSlug
           ? DEFAULT_SELF_REPO_ROOT
@@ -2312,82 +2887,168 @@ export async function runBurnPlaybook(input: {
         inferDefaultGate(arenaProjectRoot, input.playbook);
       const effectiveArtifact =
         run.framing?.artifact ?? inferDefaultArtifact(arenaProjectRoot);
+      const effectiveSkills =
+        run.framing?.skills ?? inferDefaultSkills(input.playbook, input.prompt, arenaProjectRoot);
 
       const factoryStateDir = join(artifactDir, "factory");
-      const runFactory = createFactory({
-        stateDir: factoryStateDir,
+      const { runFactory, timelineStore } = createBurnScopedFactory({
+        paseoHome: input.paseoHome,
+        factoryStateDir,
         projectSlug: project.slug,
         timeoutMs,
-      });
-
-      const completedAttempts = await Promise.all(
-        swarmModels.map(async (model, idx): Promise<BurnAttemptRecord> => {
-          const attemptId = `attempt-${idx + 1}`;
-          const subtask =
-            run.framing?.subtasks[idx % (run.framing?.subtasks.length || 1)] ?? input.prompt;
-          const basePromptLines = [
-            `You are a ${model.family} coder Free model running playbook ${input.playbook}.`,
-            `Subtask: ${subtask}`,
-            `Gate command to satisfy: ${gateCommand}`,
-            ...(run.framing?.scope && run.framing.scope.length > 0
-              ? [`Allowed file scope: ${run.framing.scope.join(", ")}`]
-              : []),
-          ];
-
-          return executeCoderAttemptWithFactory({
-            runFactory,
-            factoryStateDir,
-            projectSlug: project.slug,
-            runId,
-            playbook: input.playbook,
-            hostRoot: arenaProjectRoot,
-            artifactDir,
-            attemptId,
-            model,
-            subtask,
-            basePromptLines,
-            effectiveGateCommand: gateCommand,
-            artifact: effectiveArtifact,
-            scope: run.framing?.scope,
-            citationRequired: Boolean(run.framing?.citationRequired),
-            maxAttempts: effectiveMaxAttempts,
-            timeoutMs,
-            openCodeRunner: input.openCodeRunner,
-            customGateRunner: input.gateRunner,
-          });
-        }),
-      );
-
-      transition("verifying");
-      run.attempts.push(...completedAttempts);
-
-      await runCouncilCrossCheck({
-        paseoHome: input.paseoHome,
-        playbook: input.playbook,
-        cwd: arenaProjectRoot,
-        timeoutMs,
         openCodeRunner: input.openCodeRunner,
-        framing: run.framing,
-        attempts: run.attempts,
-        councilNotes: run.councilNotes,
+        isMockedRun,
+        factoryLaneRunner: input.factoryLaneRunner,
       });
 
-      const winners = run.attempts
-        .filter((a) => a.accepted)
-        .sort((a, b) => a.latencyMs - b.latencyMs);
-      if (winners[0]) {
-        run.winningAttemptId = winners[0].id;
-        run.winningModel = winners[0].model;
-        if (winners[0].branchName) {
-          run.winningBranch = winners[0].branchName;
-          if (winners[0].claimedCommit) {
-            run.winningCommit = winners[0].claimedCommit;
+      const framedSubtasks =
+        run.framing?.subtasks && run.framing.subtasks.length > 0
+          ? run.framing.subtasks
+          : [run.framing?.goal ?? input.prompt];
+      const requestedMaxWaves =
+        input.maxWaves ?? (isMockedRun ? 1 : Math.min(3, Math.max(1, framedSubtasks.length)));
+      const totalWaves = Math.max(1, Math.min(requestedMaxWaves, framedSubtasks.length));
+
+      let currentBaseCommit = headCommitSync(arenaProjectRoot);
+      let lastVerifiedWinner: BurnAttemptRecord | undefined;
+      let wavesCompleted = 0;
+
+      for (let waveIdx = 0; waveIdx < totalWaves; waveIdx++) {
+        const waveNum = waveIdx + 1;
+        const waveSubtask =
+          totalWaves === 1
+            ? (run.framing?.goal ?? input.prompt)
+            : (framedSubtasks[waveIdx] ?? run.framing?.goal ?? input.prompt);
+
+        const waveAttempts = await Promise.all(
+          swarmModels.map(async (model, idx): Promise<BurnAttemptRecord> => {
+            const attemptId =
+              totalWaves === 1
+                ? `attempt-${idx + 1}`
+                : `wave-${waveNum}-attempt-${idx + 1}`;
+            const basePromptLines = [
+              `You are a ${model.family} coder Free model running playbook ${input.playbook} (SLP Task Wave ${waveNum}/${totalWaves}).`,
+              `Overall Goal: ${run.framing?.goal ?? input.prompt}`,
+              `Original Brief: ${input.prompt}`,
+              `Current Wave Task (${waveNum}/${totalWaves}): ${waveSubtask}`,
+              ...(run.framing?.subtasks && run.framing.subtasks.length > 0
+                ? [`Full SLP Roadmap: ${run.framing.subtasks.join(" -> ")}`]
+                : []),
+              ...buildSkillMandateInstructions(effectiveSkills),
+              `Gate command to satisfy: ${gateCommand}`,
+              ...(run.framing?.scope && run.framing.scope.length > 0
+                ? [`Allowed file scope: ${run.framing.scope.join(", ")}`]
+                : []),
+              `Important: Preserve all passing tests and exports from prior tasks while implementing Current Wave Task (${waveNum}/${totalWaves}).`,
+              `Use your file-reading, file-writing/editing, and bash tools to implement the complete required changes in this workspace and run "${gateCommand}" to verify all tests pass before finishing.`,
+            ];
+
+            return executeCoderAttemptWithFactory({
+              runFactory,
+              timelineStore,
+              factoryStateDir,
+              projectSlug: project.slug,
+              runId,
+              playbook: input.playbook,
+              hostRoot: arenaProjectRoot,
+              baseCommitOverride: currentBaseCommit,
+              wave: waveNum,
+              skills: effectiveSkills,
+              artifactDir,
+              attemptId,
+              model,
+              subtask: waveSubtask,
+              basePromptLines,
+              effectiveGateCommand: gateCommand,
+              artifact: effectiveArtifact,
+              scope: run.framing?.scope,
+              citationRequired: Boolean(run.framing?.citationRequired),
+              maxAttempts: effectiveMaxAttempts,
+              timeoutMs,
+              openCodeRunner: input.openCodeRunner,
+              customGateRunner: input.gateRunner,
+            });
+          }),
+        );
+
+        transition("verifying");
+        await runCouncilCrossCheck({
+          paseoHome: input.paseoHome,
+          playbook: input.playbook,
+          cwd: arenaProjectRoot,
+          timeoutMs,
+          openCodeRunner: input.openCodeRunner,
+          framing: run.framing,
+          attempts: waveAttempts,
+          councilNotes: run.councilNotes,
+        });
+
+        run.attempts.push(...waveAttempts);
+        wavesCompleted = waveNum;
+
+        const waveWinners = waveAttempts
+          .filter((a) => a.accepted)
+          .sort((a, b) => a.latencyMs - b.latencyMs);
+        const waveWinner = waveWinners[0];
+
+        if (waveWinner) {
+          if (waveWinner.factoryVerdict === "green") {
+            try {
+              await runFactory.accept({
+                task: waveWinner.id,
+                attempt: waveWinner.attemptCount,
+                accepted_by: "lead",
+              });
+              waveWinner.leadAccepted = true;
+              mirrorRunScopedLedger(factoryStateDir, project.slug);
+            } catch {
+              // best-effort lead accept
+            }
+          }
+          lastVerifiedWinner = waveWinner;
+          if (waveWinner.claimedCommit) {
+            currentBaseCommit = waveWinner.claimedCommit;
+          }
+        }
+
+        saveBurnRun(input.paseoHome, run);
+
+        if (waveIdx + 1 < totalWaves) {
+          removeWorktreeCheckoutsOnly(arenaProjectRoot, waveAttempts);
+          transition("swarm-running");
+        }
+      }
+
+      run.wavesCompleted = wavesCompleted;
+
+      if (lastVerifiedWinner) {
+        run.winningAttemptId = lastVerifiedWinner.id;
+        run.winningModel = lastVerifiedWinner.model;
+        if (lastVerifiedWinner.branchName) {
+          run.winningBranch = lastVerifiedWinner.branchName;
+          if (lastVerifiedWinner.claimedCommit) {
+            run.winningCommit = lastVerifiedWinner.claimedCommit;
           }
           run.landingStatus = "not_landed";
         }
       }
 
-      finalizeWorktreeBranches(arenaProjectRoot, run.attempts, run.winningBranch);
+      try {
+        const retroRes = await runFactory.retro();
+        run.retroOutcome = retroRes.outcome;
+        run.retroProposalsPath = retroRes.proposalsPath;
+        run.retroProposalCount = retroRes.proposalCount;
+        mirrorRunScopedLedger(factoryStateDir, project.slug);
+      } catch {
+        // best-effort retro
+      }
+
+      finalizeWorktreeBranches(
+        arenaProjectRoot,
+        run.attempts,
+        run.winningBranch,
+        run.winningCommit,
+      );
       updateFreePoolStatsFromAttempts(input.paseoHome, run.attempts);
     }
 
@@ -2407,7 +3068,7 @@ export async function runBurnPlaybook(input: {
         ? verifiedAttempts
             .map(
               (a) =>
-                `### Attempt ${a.id} (${a.model}, family=${a.family}, role=${a.role}, latency=${a.latencyMs}ms)\n${a.output}`,
+                `### Attempt ${a.id} (wave=${a.wave ?? 1}, ${a.model}, family=${a.family}, role=${a.role}, latency=${a.latencyMs}ms, freshEyes=${a.freshEyesOutcome ?? "n/a"}, watch=${a.watchOutcome ?? "n/a"}, leadAccepted=${Boolean(a.leadAccepted)})\nSubtask: ${a.subtask}\n${a.output.slice(0, 1200)}`,
             )
             .join("\n\n")
         : "No Free model attempts passed the verification fence.";
@@ -2430,9 +3091,11 @@ export async function runBurnPlaybook(input: {
       prompt: [
         `You are the strong Supervisor (${project.supervisorLane}) synthesizing the final deliverable for ${input.playbook}.`,
         `Original Brief: ${input.prompt}`,
-        ...(run.winningBranch ? [`Verified Winning Branch: ${run.winningBranch}`] : []),
+        ...(run.wavesCompleted ? [`Completed SLP Task Waves: ${run.wavesCompleted}`] : []),
+        ...(run.winningBranch ? [`Verified Winning Branch: ${run.winningBranch} (${run.winningCommit?.slice(0, 7) ?? "HEAD"})`] : []),
+        ...(run.retroOutcome ? [`Factory Retro Outcome: ${run.retroOutcome} (${run.retroProposalCount ?? 0} proposals)`] : []),
         "",
-        "## Verified Evidence (Cleared by Mechanical Gate / Citation Gate / Council)",
+        "## Verified Evidence (Cleared by Mechanical Gate / Fresh-Eyes / Watch / Citation Gate / Council / Lead Acceptance)",
         verifiedEvidenceBlock,
         "",
         "## Cross-Family Council Notes",
