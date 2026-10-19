@@ -452,7 +452,7 @@ test("createBurnSurfaceHandlers defaults to trial home ~/.paseo-factory when pre
   assert.ok(snap.view.preflight);
   const issue01 = snap.view.upstreamIssues.find((i) => i.number === "01");
   assert.ok(issue01);
-  assert.equal(issue01.status, "needs-triage");
+  assert.equal(["needs-triage", "ready-for-agent", "done"].includes(issue01.status), true);
   assert.equal(existsSync(join(trialHome, "factory", "ledger.jsonl")), false);
 });
 

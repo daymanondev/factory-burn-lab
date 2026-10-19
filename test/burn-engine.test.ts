@@ -11,6 +11,7 @@ import {
   defaultSupervisorRunner,
   inferDefaultArtifact,
   inferDefaultGate,
+  landBurnRunWinningBranch,
   listBurnRuns,
   loadBurnRun,
   resolveBurnProjects,
@@ -1412,4 +1413,214 @@ test("buildSmartRepoExcerpts and oss-lab index nested files beyond 20 lines via 
     rmSync(externalRepoDir, { recursive: true, force: true });
   }
 });
+
+test("multi-task SLP wave pipeline executes sequential tasks with skills, freshEyes, watch, meter, lead accept, retro, and cumulative landing", async () => {
+  const paseoHome = mkdtempSync(join(tmpdir(), "burn-slp-waves-home-"));
+  const repoDir = mkdtempSync(join(tmpdir(), "burn-slp-waves-repo-"));
+
+  try {
+    initTempGitRepo(repoDir);
+    const added = addBurnProject(paseoHome, repoDir, { name: "SLP Multi-Wave Repo" });
+    assert.equal(added.ok, true);
+    if (!added.ok) return;
+
+    saveFreePool(paseoHome, {
+      updatedAt: new Date().toISOString(),
+      models: [
+        {
+          id: "opencode/beam-free",
+          family: "beam",
+          displayName: "Beam Free",
+          contextWindow: 256_000,
+          healthy: true,
+          latencyMs: 140,
+          gatePassed: true,
+          citationPassed: true,
+          roles: ["coder", "reviewer"],
+          wins: 2,
+          attempts: 2,
+          lastScoutedAt: new Date().toISOString(),
+        },
+        {
+          id: "opencode/space-bunny-free",
+          family: "space-bunny",
+          displayName: "Space Bunny Free",
+          contextWindow: 256_000,
+          healthy: true,
+          latencyMs: 180,
+          gatePassed: true,
+          citationPassed: true,
+          roles: ["coder", "reader-1m", "reviewer"],
+          wins: 2,
+          attempts: 2,
+          lastScoutedAt: new Date().toISOString(),
+        },
+        {
+          id: "opencode/deepseek-v4.1-flash-free",
+          family: "deepseek",
+          displayName: "DeepSeek V4.1 Flash Free",
+          contextWindow: 200_000,
+          healthy: true,
+          latencyMs: 190,
+          gatePassed: true,
+          citationPassed: true,
+          roles: ["reviewer", "reader-1m"],
+          wins: 1,
+          attempts: 1,
+          lastScoutedAt: new Date().toISOString(),
+        },
+      ],
+    });
+
+    let framingPromptSeen = "";
+    const run = await runBurnPlaybook({
+      paseoHome,
+      projectSlug: added.project.slug,
+      playbook: "proto-arena",
+      prompt: "Build an interactive web game with engine, UI, and regression tests",
+      maxWaves: 3,
+      maxAttempts: 1,
+      supervisorRunner: async ({ phase, prompt }) => {
+        if (phase === "framing") {
+          framingPromptSeen = prompt;
+          return {
+            ok: true,
+            stdout: JSON.stringify({
+              goal: "Build multi-wave web game following SLP core",
+              subtasks: [
+                "Task 1: Create src/engine.ts core game engine",
+                "Task 2: Create src/ui.ts interactive UI layer importing engine",
+                "Task 3: Create test/game.test.ts verifying engine and UI together",
+              ],
+              gateCommand: 'node -e "process.exit(0)"',
+              artifact: "README.md",
+              skills: ["tdd", "codebase-design", "frontend-design"],
+              citationRequired: false,
+            }),
+          };
+        }
+        return {
+          ok: true,
+          stdout: "# Multi-Wave SLP Synthesis Report\n\nAll 3 sequential task waves verified and landed.",
+        };
+      },
+      openCodeRunner: async ({ model, prompt, cwd }) => {
+        if (prompt.includes("COUNCIL_REVIEW")) {
+          return {
+            ok: true,
+            stdout: "VERDICT: APPROVE — Wave diff and gate verified.",
+            stderr: "",
+            latencyMs: 60,
+          };
+        }
+        if (prompt.includes("SLP Task Wave 1/3")) {
+          writeFileSync(
+            join(cwd, "src", "engine.ts"),
+            "export const ENGINE_READY = true;\n",
+            "utf8",
+          );
+          return {
+            ok: true,
+            stdout: `Wave 1 engine implemented by ${model}`,
+            stderr: "",
+            latencyMs: model.includes("beam") ? 100 : 160,
+          };
+        }
+        if (prompt.includes("SLP Task Wave 2/3")) {
+          // Wave 2 must see src/engine.ts committed in Wave 1!
+          assert.equal(
+            existsSync(join(cwd, "src", "engine.ts")),
+            true,
+            "Wave 2 worktree must inherit Wave 1 winning commit (src/engine.ts)",
+          );
+          writeFileSync(
+            join(cwd, "src", "ui.ts"),
+            "import { ENGINE_READY } from './engine.ts';\nexport const UI_READY = ENGINE_READY;\n",
+            "utf8",
+          );
+          return {
+            ok: true,
+            stdout: `Wave 2 UI implemented by ${model}`,
+            stderr: "",
+            latencyMs: model.includes("space-bunny") ? 95 : 170,
+          };
+        }
+        if (prompt.includes("SLP Task Wave 3/3")) {
+          // Wave 3 must see both src/engine.ts (Wave 1) and src/ui.ts (Wave 2)!
+          assert.equal(existsSync(join(cwd, "src", "engine.ts")), true);
+          assert.equal(existsSync(join(cwd, "src", "ui.ts")), true);
+          mkdirSync(join(cwd, "test"), { recursive: true });
+          writeFileSync(
+            join(cwd, "test", "game.test.ts"),
+            "// Full regression test suite\nexport const TESTS_GREEN = true;\n",
+            "utf8",
+          );
+          return {
+            ok: true,
+            stdout: `Wave 3 regression tests implemented by ${model}`,
+            stderr: "",
+            latencyMs: model.includes("beam") ? 105 : 175,
+          };
+        }
+        return { ok: true, stdout: "ok", stderr: "", latencyMs: 100 };
+      },
+    });
+
+    assert.equal(run.status, "completed");
+    assert.equal(run.wavesCompleted, 3);
+    assert.equal(run.attempts.length, 6);
+    assert.match(framingPromptSeen, /REPOSITORY_CONTEXT_EXCERPTS:/);
+    assert.deepEqual(run.framing?.skills, ["tdd", "codebase-design", "frontend-design"]);
+
+    // Verify each wave had a Lead-accepted winner with Fresh-Eyes CLEAR and Watch WRITTEN
+    for (const waveNum of [1, 2, 3]) {
+      const waveLeadWinner = run.attempts.find((a) => a.wave === waveNum && a.leadAccepted);
+      assert.ok(waveLeadWinner, `Expected a Lead-accepted winner for wave ${waveNum}`);
+      assert.equal(waveLeadWinner.freshEyesOutcome, "clear");
+      assert.equal(waveLeadWinner.watchOutcome, "written");
+      assert.ok(waveLeadWinner.watchAnswers);
+      assert.equal(typeof waveLeadWinner.watchAnswers["test-weakened"], "number");
+    }
+
+    // Verify Retro ran and wrote proposals file + ledger events
+    assert.equal(run.retroOutcome, "written");
+    assert.ok(run.retroProposalsPath);
+    assert.equal(existsSync(run.retroProposalsPath!), true);
+
+    const ledgerPath = join(
+      paseoHome,
+      "burn-lab",
+      "runs",
+      run.id,
+      "factory",
+      "projects",
+      added.project.slug,
+      "ledger.jsonl",
+    );
+    const ledgerText = readFileSync(ledgerPath, "utf8");
+    assert.match(ledgerText, /"event":"contract_set"/);
+    assert.match(ledgerText, /"skills":\["tdd","codebase-design","frontend-design"\]/);
+    assert.match(ledgerText, /"freshEyes":true/);
+    assert.match(ledgerText, /"watch":true/);
+    assert.match(ledgerText, /"event":"fresh_eyes_written"/);
+    assert.match(ledgerText, /"event":"watch_written"/);
+    assert.match(ledgerText, /"event":"meter_written"/);
+    assert.match(ledgerText, /"event":"attempt_accepted".*"accepted_by":"lead"/);
+    assert.match(ledgerText, /"event":"retro_written"/);
+
+    // Land the final winning branch into repoDir and verify all 3 waves' files are present!
+    const landed = await landBurnRunWinningBranch(paseoHome, run.id);
+    assert.equal(landed.ok, true);
+    if (landed.ok) {
+      assert.equal(landed.landing, "landed");
+    }
+    assert.equal(existsSync(join(repoDir, "src", "engine.ts")), true);
+    assert.equal(existsSync(join(repoDir, "src", "ui.ts")), true);
+    assert.equal(existsSync(join(repoDir, "test", "game.test.ts")), true);
+  } finally {
+    rmSync(paseoHome, { recursive: true, force: true });
+    rmSync(repoDir, { recursive: true, force: true });
+  }
+});
+
 

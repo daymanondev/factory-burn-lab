@@ -389,6 +389,8 @@ function stripAnsi(text: string): string {
   return text.replace(/\u001b\[[0-9;]*[A-Za-z]/g, "");
 }
 
+export const DEFAULT_WARP_PROXY_URL = "http://127.0.0.1:40000";
+
 function defaultOpenCodeRunner(input: {
   model: string;
   prompt: string;
@@ -398,11 +400,24 @@ function defaultOpenCodeRunner(input: {
   const startedAt = Date.now();
   const bin = resolveOpenCodeBinary();
   const isWinCmd = process.platform === "win32" && /\.(cmd|bat)$/i.test(bin);
+  const extendedEnv = buildExtendedPathEnv();
+  const useWarpProxy =
+    process.env.BURN_LAB_DISABLE_WARP_PROXY !== "1" && existsSync("/usr/local/bin/warp-cli");
 
   return new Promise((resolvePromise) => {
     const child = spawn(bin, ["run", "--standalone", "--auto", "-m", input.model, input.prompt], {
       cwd: input.cwd,
-      env: { ...buildExtendedPathEnv(), PWD: input.cwd },
+      env: {
+        ...extendedEnv,
+        ...(useWarpProxy
+          ? {
+              HTTPS_PROXY: extendedEnv.HTTPS_PROXY ?? DEFAULT_WARP_PROXY_URL,
+              HTTP_PROXY: extendedEnv.HTTP_PROXY ?? DEFAULT_WARP_PROXY_URL,
+              NO_PROXY: extendedEnv.NO_PROXY ?? "127.0.0.1,localhost",
+            }
+          : {}),
+        PWD: input.cwd,
+      },
       stdio: ["ignore", "pipe", "pipe"],
       windowsHide: true,
       ...(isWinCmd ? { shell: true } : {}),
@@ -648,7 +663,7 @@ export async function scoutFreePool(input: {
     );
 
     const now = new Date().toISOString();
-    const concurrency = input.concurrency ?? 5;
+    const concurrency = input.concurrency ?? 3;
 
     const updatedModels = await mapWithConcurrency(discovered, concurrency, async (candidate) => {
       const prev = existingById.get(candidate.id);
@@ -688,7 +703,7 @@ export async function scoutFreePool(input: {
         const runRes = await runOpenCodeFreeModel({
           model: candidate.id,
           prompt,
-          cwd: fixtureRepoDir,
+          cwd: undefined,
           timeoutMs: input.timeoutMs ?? 20_000,
           runner: input.openCodeRunner,
         });
@@ -721,9 +736,18 @@ export async function scoutFreePool(input: {
       };
     });
 
+    const updatedById = new Map(updatedModels.map((m) => [m.id, m]));
+    const mergedModels =
+      input.models && input.models.length > 0
+        ? [
+            ...existingState.models.map((m) => updatedById.get(m.id) ?? m),
+            ...updatedModels.filter((m) => !existingById.has(m.id)),
+          ]
+        : updatedModels;
+
     const nextState: FreePoolState = {
       updatedAt: now,
-      models: updatedModels,
+      models: mergedModels,
     };
     saveFreePool(input.paseoHome, nextState);
     return nextState;
