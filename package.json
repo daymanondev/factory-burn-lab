@@ -1,6 +1,6 @@
 {
   "name": "factory-burn-lab",
-  "version": "0.0.5",
+  "version": "0.0.6",
   "description": "Companion Paseo plugin for paseo-factory: autonomous OpenCode free-model burner (Scout Pool, OSS Lab, Proto Arena, Night Shift, Self-Evolve) with 3-tier Supervisor anti-hallucination fencing.",
   "type": "module",
   "private": true,
@@ -20,7 +20,7 @@
     "preflight": "node scripts/preflight-permissions.mjs"
   },
   "devDependencies": {
-    "@getpaseo/plugin": "0.11.2",
+    "@getpaseo/plugin": "0.13.0",
     "@types/node": "^22.10.0",
     "@types/react": "19.2.18",
     "esbuild": "0.25.12",

@@ -79,7 +79,7 @@ export interface BurnDaemonAgentSnapshot {
 export interface BurnDaemonApi {
   agents: {
     list(options?: {
-      filter?: { labels?: Record<string, string>; includeArchived?: boolean };
+      filter?: { labels?: Record<string, string>; includeArchived?: boolean; includeBackground?: boolean };
     }): Promise<{ entries: { agent: BurnDaemonAgentSnapshot }[] }>;
     create(options: {
       config: {
@@ -91,10 +91,18 @@ export interface BurnDaemonApi {
       title: string;
       labels: Record<string, string>;
       prompt?: string;
+      background?: boolean;
     }): Promise<{ id: string }>;
     ref(id: string): {
       send(text: string): Promise<void>;
     };
+  };
+  workspaces?: {
+    open(options: {
+      cwd: string;
+      title?: string;
+      background?: boolean;
+    }): Promise<{ workspace: { id: string } }>;
   };
   providers: {
     listModels(provider: string): Promise<{
@@ -169,9 +177,29 @@ async function findLiveSupervisorAgent(
     filter: {
       labels: { seat: "supervisor", project: projectSlug },
       includeArchived: false,
+      includeBackground: true,
     },
   });
   return page.entries.find((e) => e.agent.archivedAt === null)?.agent;
+}
+
+async function markBurnWorktreesBackground(
+  daemon: BurnDaemonApi | undefined,
+  run: BurnRunRecord,
+): Promise<void> {
+  if (!daemon?.workspaces?.open) return;
+  for (const attempt of run.attempts) {
+    if (!attempt.worktreeDir) continue;
+    try {
+      await daemon.workspaces.open({
+        cwd: attempt.worktreeDir,
+        title: `Burn Lab · ${run.playbook} · ${attempt.id}`,
+        background: true,
+      });
+    } catch {
+      // Best-effort background workspace registration on Paseo >=0.13.0.
+    }
+  }
 }
 
 function summarizeRun(run: BurnRunRecord): BurnRunSummaryView {
@@ -585,7 +613,7 @@ export function createBurnSurfaceHandlers(deps: BurnSurfaceDeps = {}) {
         gateCommand?: string;
         awaitCompletion?: boolean;
       },
-      _context?: BurnCallContext,
+      context?: BurnCallContext,
     ) {
       const trimmedPrompt = input.prompt.trim();
       if (!trimmedPrompt) {
@@ -593,6 +621,7 @@ export function createBurnSurfaceHandlers(deps: BurnSurfaceDeps = {}) {
       }
 
       try {
+        const daemon = resolveDaemon(context);
         const initialRun = allocateBurnRunRecord({
           paseoHome,
           playbook: input.playbook,
@@ -627,11 +656,14 @@ export function createBurnSurfaceHandlers(deps: BurnSurfaceDeps = {}) {
         });
 
         if (input.awaitCompletion === false) {
-          void burnRunPromise.catch(() => {});
+          void burnRunPromise
+            .then((completed) => markBurnWorktreesBackground(daemon, completed))
+            .catch(() => {});
           return { ok: true as const, run: summarizeRun(initialRun) };
         }
 
         const completedRun = await burnRunPromise;
+        await markBurnWorktreesBackground(daemon, completedRun);
         return {
           ok: true as const,
           run: summarizeRun(completedRun),

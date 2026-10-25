@@ -24,7 +24,6 @@ export default function contribute(client: PluginClientContext) {
       id: "factory-burn-lab",
       title: "Burn Lab",
       icon: "Flame",
-      context: "workspace",
       locations: ["explorer", "workspace"],
       Component: BurnLabPanel,
     }),

@@ -15,7 +15,7 @@ import {
 } from "./server/surface-rpc.ts";
 
 const PLUGIN_ID = "factory-burn-lab";
-const SHELL_VERSION = "0.0.1";
+const SHELL_VERSION = "0.0.6";
 
 const log = (message: string) => console.log(`[${PLUGIN_ID}] ${message}`);
 

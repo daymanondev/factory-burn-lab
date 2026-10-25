@@ -259,7 +259,7 @@ test("burn.supervisor.open creates or reuses the Project's Supervisor seat agent
     const fakeDaemon = {
       agents: {
         async list(options?: {
-          filter?: { labels?: Record<string, string>; includeArchived?: boolean };
+          filter?: { labels?: Record<string, string>; includeArchived?: boolean; includeBackground?: boolean };
         }) {
           const wanted = options?.filter?.labels ?? {};
           const entries = createdAgents
